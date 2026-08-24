@@ -2,7 +2,7 @@ import torch
 from typing import Optional
 
 class OakenQuantizer:
-    QUANTIZE_BITS = 4
+    QUANTIZE_BITS = 8
     OUTLIER_BITS = 5
     FLOAT_TOLERANCE = 1e-6
     
