@@ -3,7 +3,7 @@ from typing import Optional
 
 class OakenQuantizer:
     QUANTIZE_BITS = 8
-    OUTLIER_BITS = 5
+    OUTLIER_BITS = 9
     FLOAT_TOLERANCE = 1e-6
     
     @classmethod
@@ -107,11 +107,35 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
             grouped_tensors[-2] = cls.uniform_quantization_threshold(grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor)
 
-        # heat_map = torch.zeros_like(input_tensor)
+# heat_map = torch.zeros_like(input_tensor)
+
         for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
             result_tensor += tensor * mask
-            # heat_map += idx * mask
+        
+        # ============================================================
+        # DELTA ENCODING
+        # ============================================================
+        
+        delta_tensor = torch.empty_like(result_tensor)
+        
+        # First token remains unchanged
+        delta_tensor[:, :, 0, :] = result_tensor[:, :, 0, :]
+        
+        # Store difference between consecutive tokens
+        delta_tensor[:, :, 1:, :] = (
+            result_tensor[:, :, 1:, :]
+            - result_tensor[:, :, :-1, :]
+        )
+        
+        result_tensor = delta_tensor
+        
+        # heat_map += idx * mask
+        
         heat_map = None
-
-        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
+        
+        val_frac = [
+            (torch.count_nonzero(mask) / torch.numel(mask)).item()
+            for mask in masks
+        ]
+        
         return (result_tensor, val_frac, heat_map)
