@@ -112,24 +112,22 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
             result_tensor += tensor * mask
         
-            # ============================================================
-            # DELTA ENCODING
-            # ============================================================
-            
-            delta_tensor = torch.empty_like(result_tensor)
-            
-            # First token remains unchanged
-            delta_tensor[:, 0, :] = result_tensor[:, 0, :]
-            
-            # Difference between consecutive tokens
-            delta_tensor[:, 1:, :] = (
-                result_tensor[:, 1:, :]
-                - result_tensor[:, :-1, :]
-            )
-            
-            result_tensor = delta_tensor
+        # ============================================================
+        # DELTA ENCODING
+        # ============================================================
         
-        # heat_map += idx * mask
+        delta_tensor = torch.empty_like(result_tensor)
+        
+        # First token remains unchanged
+        delta_tensor[:, 0, :] = result_tensor[:, 0, :]
+        
+        # Difference between consecutive tokens
+        delta_tensor[:, 1:, :] = (
+            result_tensor[:, 1:, :]
+            - result_tensor[:, :-1, :]
+        )
+        
+        result_tensor = delta_tensor
         
         heat_map = None
         
@@ -152,6 +150,6 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         Input shape:
             [batch, heads, sequence_length, head_dim]
 
-        Delta encoding was performed along dimension 2.
+        Delta encoding was performed along dimension 1.
         """
-        return torch.cumsum(delta_tensor, dim=2)
+        return torch.cumsum(delta_tensor, dim=1)
