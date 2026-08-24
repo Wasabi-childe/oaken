@@ -139,3 +139,19 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ]
         
         return (result_tensor, val_frac, heat_map)
+
+ # ============================================================
+    # DELTA DECODING
+    # ============================================================
+
+    @staticmethod
+    def delta_decode(delta_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Decode delta-encoded KV cache.
+
+        Input shape:
+            [batch, heads, sequence_length, head_dim]
+
+        Delta encoding was performed along dimension 2.
+        """
+        return torch.cumsum(delta_tensor, dim=2)
