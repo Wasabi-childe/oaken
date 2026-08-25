@@ -132,57 +132,354 @@ class OakenQuantizer:
         truncated = int16_tensor & 0b1_11111_1110_0000_00
         return truncated.view(torch.float16)
 
+import torch
+
+from .huffman import HuffmanCodec
+
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
     @classmethod
-    def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
-                    quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
-        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+    def downsample(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float],
+        quantize_outlier: bool = False,
+        use_group_shift: bool = True,
+        return_huffman_stats: bool = False
+    ):
+
+        grouped_tensors, masks = cls.get_multigroup_threshold(
+            input_tensor,
+            threshold_lowers,
+            threshold_uppers
+        )
+
+        result_tensor = torch.zeros_like(
+            input_tensor
+        ).to(input_tensor.device).half()
+
+        # Store Huffman results
+        huffman_stats = []
+
+        # ========================================================
+        # QUANTIZE OUTLIERS
+        # ========================================================
 
         if quantize_outlier:
-            # Quantize inner-most group
-            minval_tensor = torch.min(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-1] = cls.uniform_quantization_threshold(grouped_tensors[-1], cls.OUTLIER_BITS, minval_tensor, maxval_tensor)
 
-            # Quantize outer groups
-            for idx in range(len(threshold_lowers) - 1):
-                threshold_lower_tensor = torch.tensor(threshold_lowers[idx]).to(input_tensor.device).half()
-                threshold_upper_tensor = torch.tensor(threshold_uppers[idx]).to(input_tensor.device).half()
+            # ----------------------------------------------------
+            # INNER-MOST GROUP
+            # ----------------------------------------------------
 
-                higher_mask = grouped_tensors[idx] > 0
-                lower_mask = grouped_tensors[idx] < 0
-                higher_outlier = grouped_tensors[idx] * higher_mask
-                lower_outlier = grouped_tensors[idx] * lower_mask
+            minval_tensor = torch.min(
+                grouped_tensors[-1],
+                dim=-1
+            ).values.unsqueeze(-1)
+
+            maxval_tensor = torch.max(
+                grouped_tensors[-1],
+                dim=-1
+            ).values.unsqueeze(-1)
+
+            # Get actual quantization indices
+            inner_indices = cls.uniform_quantization_threshold(
+                grouped_tensors[-1],
+                cls.OUTLIER_BITS,
+                minval_tensor,
+                maxval_tensor,
+                return_indices=True
+            )
+
+            # Dequantize as before
+            grouped_tensors[-1] = cls.uniform_quantization_threshold(
+                grouped_tensors[-1],
+                cls.OUTLIER_BITS,
+                minval_tensor,
+                maxval_tensor
+            )
+
+            # Huffman measurement
+            if return_huffman_stats:
+
+                valid_indices = inner_indices[
+                    masks[-1]
+                ]
+
+                if valid_indices.numel() > 0:
+
+                    stats = HuffmanCodec.measure_compression(
+                        valid_indices,
+                        bits_per_symbol=cls.OUTLIER_BITS
+                    )
+
+                    huffman_stats.append({
+                        "group": len(threshold_lowers) - 1,
+                        "bits": cls.OUTLIER_BITS,
+                        **stats
+                    })
+
+            # ----------------------------------------------------
+            # OUTER GROUPS
+            # ----------------------------------------------------
+
+            for idx in range(
+                len(threshold_lowers) - 1
+            ):
+
+                threshold_lower_tensor = torch.tensor(
+                    threshold_lowers[idx],
+                    device=input_tensor.device,
+                    dtype=input_tensor.dtype
+                )
+
+                threshold_upper_tensor = torch.tensor(
+                    threshold_uppers[idx],
+                    device=input_tensor.device,
+                    dtype=input_tensor.dtype
+                )
+
+                higher_mask = (
+                    grouped_tensors[idx] > 0
+                )
+
+                lower_mask = (
+                    grouped_tensors[idx] < 0
+                )
+
+                higher_outlier = (
+                    grouped_tensors[idx]
+                    * higher_mask
+                )
+
+                lower_outlier = (
+                    grouped_tensors[idx]
+                    * lower_mask
+                )
+
+                # ------------------------------------------------
+                # GROUP SHIFT
+                # ------------------------------------------------
 
                 if use_group_shift:
-                    higher_outlier -= threshold_upper_tensor
-                    lower_outlier -= threshold_lower_tensor
+
+                    higher_outlier -= (
+                        threshold_upper_tensor
+                    )
+
+                    lower_outlier -= (
+                        threshold_lower_tensor
+                    )
+
+                shifted_tensor = (
+                    higher_outlier * higher_mask
+                    + lower_outlier * lower_mask
+                )
+
+                # ------------------------------------------------
+                # QUANTIZATION BIT WIDTH
+                # ------------------------------------------------
 
                 if idx == len(threshold_lowers) - 2:
-                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.QUANTIZE_BITS)
+                    quant_bits = cls.QUANTIZE_BITS
                 else:
-                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.OUTLIER_BITS)
+                    quant_bits = cls.OUTLIER_BITS
 
-                higher_outlier = total_outlier * higher_mask
-                lower_outlier = total_outlier * lower_mask
-                
+                # ------------------------------------------------
+                # GET QUANTIZATION INDICES
+                # ------------------------------------------------
+
+                minval = torch.min(
+                    shifted_tensor
+                ).item()
+
+                maxval = torch.max(
+                    shifted_tensor
+                ).item()
+
+                outer_indices = (
+                    cls.uniform_quantization_threshold(
+                        shifted_tensor,
+                        quant_bits,
+                        minval,
+                        maxval,
+                        return_indices=True
+                    )
+                )
+
+                # ------------------------------------------------
+                # DEQUANTIZE
+                # ------------------------------------------------
+
+                total_outlier = (
+                    cls.uniform_quantization_threshold(
+                        shifted_tensor,
+                        quant_bits,
+                        minval,
+                        maxval
+                    )
+                )
+
+                higher_outlier = (
+                    total_outlier
+                    * higher_mask
+                )
+
+                lower_outlier = (
+                    total_outlier
+                    * lower_mask
+                )
+
+                # ------------------------------------------------
+                # UNDO GROUP SHIFT
+                # ------------------------------------------------
+
                 if use_group_shift:
-                    higher_outlier += threshold_upper_tensor
-                    lower_outlier += threshold_lower_tensor
 
-                grouped_tensors[idx] = (higher_outlier * higher_mask) + (lower_outlier * lower_mask)
+                    higher_outlier += (
+                        threshold_upper_tensor
+                    )
+
+                    lower_outlier += (
+                        threshold_lower_tensor
+                    )
+
+                grouped_tensors[idx] = (
+                    higher_outlier * higher_mask
+                    + lower_outlier * lower_mask
+                )
+
+                # ------------------------------------------------
+                # HUFFMAN
+                # ------------------------------------------------
+
+                if return_huffman_stats:
+
+                    valid_mask = masks[idx]
+
+                    valid_indices = outer_indices[
+                        valid_mask
+                    ]
+
+                    if valid_indices.numel() > 0:
+
+                        stats = HuffmanCodec.measure_compression(
+                            valid_indices,
+                            bits_per_symbol=quant_bits
+                        )
+
+                        huffman_stats.append({
+                            "group": idx,
+                            "bits": quant_bits,
+                            **stats
+                        })
+
+        # ========================================================
+        # NORMAL OAKEN MODE
+        # ========================================================
+
         else:
-            # Quantize middle_group
-            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-2] = cls.uniform_quantization_threshold(grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor)
 
-        # heat_map = torch.zeros_like(input_tensor)
-        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
-            result_tensor += tensor * mask
-            # heat_map += idx * mask
+            # ----------------------------------------------------
+            # MIDDLE GROUP
+            # ----------------------------------------------------
+
+            minval_tensor = torch.min(
+                grouped_tensors[-2],
+                dim=-1
+            ).values.unsqueeze(-1)
+
+            maxval_tensor = torch.max(
+                grouped_tensors[-2],
+                dim=-1
+            ).values.unsqueeze(-1)
+
+            # Actual quantization indices
+            middle_indices = (
+                cls.uniform_quantization_threshold(
+                    grouped_tensors[-2],
+                    cls.QUANTIZE_BITS,
+                    minval_tensor,
+                    maxval_tensor,
+                    return_indices=True
+                )
+            )
+
+            # Normal Oaken dequantized output
+            grouped_tensors[-2] = (
+                cls.uniform_quantization_threshold(
+                    grouped_tensors[-2],
+                    cls.QUANTIZE_BITS,
+                    minval_tensor,
+                    maxval_tensor
+                )
+            )
+
+            # ----------------------------------------------------
+            # HUFFMAN
+            # ----------------------------------------------------
+
+            if return_huffman_stats:
+
+                valid_indices = middle_indices[
+                    masks[-2]
+                ]
+
+                if valid_indices.numel() > 0:
+
+                    stats = HuffmanCodec.measure_compression(
+                        valid_indices,
+                        bits_per_symbol=cls.QUANTIZE_BITS
+                    )
+
+                    huffman_stats.append({
+                        "group": len(threshold_lowers) - 2,
+                        "bits": cls.QUANTIZE_BITS,
+                        **stats
+                    })
+
+        # ========================================================
+        # RECONSTRUCT RESULT
+        # ========================================================
+
+        for idx, (tensor, mask) in enumerate(
+            zip(grouped_tensors, masks)
+        ):
+
+            result_tensor += (
+                tensor * mask
+            )
+
+        # ========================================================
+        # SPARSITY
+        # ========================================================
+
+        val_frac = [
+            (
+                torch.count_nonzero(mask)
+                / torch.numel(mask)
+            ).item()
+            for mask in masks
+        ]
+
         heat_map = None
 
-        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
-        return (result_tensor, val_frac, heat_map)
+        # ========================================================
+        # RETURN
+        # ========================================================
+
+        if return_huffman_stats:
+
+            return (
+                result_tensor,
+                val_frac,
+                heat_map,
+                huffman_stats
+            )
+
+        return (
+            result_tensor,
+            val_frac,
+            heat_map
+        )
