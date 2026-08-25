@@ -43,7 +43,7 @@ class OakenQuantizer:
         ):
 
             if idx == len(threshold_lowers) - 1:
-
+                # Inner-most group
                 mask = torch.logical_and(
                     input_tensor > prev_thr_low,
                     input_tensor < prev_thr_up
@@ -53,7 +53,7 @@ class OakenQuantizer:
                 prev_thr_low is not None
                 and prev_thr_up is not None
             ):
-
+                # Middle group
                 mask = torch.logical_or(
                     torch.logical_and(
                         prev_thr_low < input_tensor,
@@ -66,7 +66,7 @@ class OakenQuantizer:
                 )
 
             else:
-
+                # Outer-most group
                 mask = torch.logical_or(
                     input_tensor <= thr_low,
                     thr_up <= input_tensor
@@ -77,6 +77,13 @@ class OakenQuantizer:
 
             prev_thr_low = thr_low
             prev_thr_up = thr_up
+
+        assert (
+            len(threshold_lowers)
+            == len(threshold_uppers)
+            == len(group_tensors)
+            == len(group_masks)
+        )
 
         return group_tensors, group_masks
 
@@ -94,10 +101,17 @@ class OakenQuantizer:
 
         rangeval = maxval - minval
 
+        # Avoid division by zero
+        rangeval = torch.where(
+            rangeval.abs() < OakenQuantizer.FLOAT_TOLERANCE,
+            torch.ones_like(rangeval),
+            rangeval
+        )
+
         qx = (2 ** bits - 1) / rangeval
         offset = minval * qx
 
-        # Integer quantization indices
+        # Actual integer quantization indices
         quantized = torch.round(
             qx * tensor - offset
         )
@@ -108,20 +122,18 @@ class OakenQuantizer:
         )
 
         # ========================================================
-        # HUFFMAN MEASUREMENT
+        # HUFFMAN COMPRESSION MEASUREMENT
         # ========================================================
 
-        # These are the ACTUAL quantization indices.
-        symbols = quantized.to(torch.int32)
-
-        encoded_bits, codes = OakenQuantizer.huffman_encode_tensor(
-            symbols
+        # quantized contains the actual integer symbols produced
+        # by Oaken quantization.
+        huffman_bits = OakenQuantizer.huffman_encode_tensor(
+            quantized
         )
 
-        original_bits = symbols.numel() * bits
-        huffman_bits = len(encoded_bits)
+        original_bits = quantized.numel() * bits
 
-        if huffman_bits > 0:
+        if huffman_bits > 0 and original_bits > 0:
 
             compression_ratio = (
                 original_bits / huffman_bits
@@ -140,11 +152,9 @@ class OakenQuantizer:
             )
 
         # ========================================================
-        # EXISTING OAKEN BEHAVIOR
+        # DEQUANTIZATION
         # ========================================================
 
-        # Dequantization is still performed here so the rest
-        # of Oaken continues receiving FP16 values.
         return (quantized + offset) / qx
 
     @staticmethod
@@ -161,7 +171,7 @@ class OakenQuantizer:
         )
 
     # ============================================================
-    # HUFFMAN
+    # HUFFMAN ENCODING
     # ============================================================
 
     @staticmethod
@@ -176,7 +186,7 @@ class OakenQuantizer:
         )
 
         if len(values) == 0:
-            return "", {}
+            return 0
 
         frequencies = Counter(values)
 
@@ -189,47 +199,47 @@ class OakenQuantizer:
 
         # Single-symbol case
         if len(heap) == 1:
+            return len(values)
 
-            symbol = heap[0][1][0][0]
+        # Build Huffman tree
+        while len(heap) > 1:
 
-            codes = {
-                symbol: "0"
-            }
+            low = heapq.heappop(heap)
+            high = heapq.heappop(heap)
 
-        else:
+            for item in low[1]:
+                item[1] = "0" + item[1]
 
-            while len(heap) > 1:
+            for item in high[1]:
+                item[1] = "1" + item[1]
 
-                low = heapq.heappop(heap)
-                high = heapq.heappop(heap)
+            merged = [
+                low[0] + high[0],
+                low[1] + high[1]
+            ]
 
-                for item in low[1]:
-                    item[1] = "0" + item[1]
+            heapq.heappush(
+                heap,
+                merged
+            )
 
-                for item in high[1]:
-                    item[1] = "1" + item[1]
+        codes = {
+            symbol: code
+            for symbol, code in heap[0][1]
+        }
 
-                merged = [
-                    low[0] + high[0],
-                    low[1] + high[1]
-                ]
-
-                heapq.heappush(
-                    heap,
-                    merged
-                )
-
-            codes = {
-                symbol: code
-                for symbol, code in heap[0][1]
-            }
-
-        encoded = "".join(
-            codes[x]
-            for x in values
+        # We only calculate the number of encoded bits.
+        # We do not construct the actual bitstream.
+        encoded_bits = sum(
+            len(codes[value])
+            for value in values
         )
 
-        return encoded, codes
+        return encoded_bits
+
+    # ============================================================
+    # MANTISSA DOWNSAMPLING
+    # ============================================================
 
     @classmethod
     def downsample_mantissa(cls, tensor):
@@ -243,6 +253,7 @@ class OakenQuantizer:
 
         return truncated.view(torch.float16)
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
     @classmethod
@@ -255,6 +266,10 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         use_group_shift: bool = True
     ):
 
+        # ============================================================
+        # CREATE GROUPS
+        # ============================================================
+
         grouped_tensors, masks = cls.get_multigroup_threshold(
             input_tensor,
             threshold_lowers,
@@ -265,11 +280,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             input_tensor
         ).to(input_tensor.device).half()
 
+        # ============================================================
+        # QUANTIZE OUTLIERS
+        # ============================================================
+
         if quantize_outlier:
 
-            # ====================================================
-            # INNER GROUP
-            # ====================================================
+            # --------------------------------------------------------
+            # INNER-MOST GROUP
+            # --------------------------------------------------------
 
             minval_tensor = torch.min(
                 grouped_tensors[-1],
@@ -290,9 +309,9 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
             )
 
-            # ====================================================
+            # --------------------------------------------------------
             # OUTER GROUPS
-            # ====================================================
+            # --------------------------------------------------------
 
             for idx in range(
                 len(threshold_lowers) - 1
@@ -326,7 +345,10 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     * lower_mask
                 )
 
-                # Group shifting
+                # ----------------------------------------------------
+                # GROUP SHIFT
+                # ----------------------------------------------------
+
                 if use_group_shift:
 
                     higher_outlier -= (
@@ -336,6 +358,10 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     lower_outlier -= (
                         threshold_lower_tensor
                     )
+
+                # ----------------------------------------------------
+                # QUANTIZE GROUP
+                # ----------------------------------------------------
 
                 if idx == len(threshold_lowers) - 2:
 
@@ -363,7 +389,10 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     * lower_mask
                 )
 
-                # Undo group shift
+                # ----------------------------------------------------
+                # UNDO GROUP SHIFT
+                # ----------------------------------------------------
+
                 if use_group_shift:
 
                     higher_outlier += (
@@ -379,11 +408,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     + lower_outlier * lower_mask
                 )
 
+        # ============================================================
+        # NORMAL MODE
+        # ============================================================
+
         else:
 
-            # ====================================================
+            # --------------------------------------------------------
             # MIDDLE GROUP
-            # ====================================================
+            # --------------------------------------------------------
 
             minval_tensor = torch.min(
                 grouped_tensors[-2],
@@ -404,9 +437,9 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
             )
 
-        # ========================================================
+        # ============================================================
         # RECONSTRUCT RESULT
-        # ========================================================
+        # ============================================================
 
         for tensor, mask in zip(
             grouped_tensors,
@@ -417,9 +450,9 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 tensor * mask
             )
 
-        # ========================================================
+        # ============================================================
         # SPARSITY
-        # ========================================================
+        # ============================================================
 
         val_frac = [
             (
@@ -432,6 +465,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         heat_map = None
 
         # No delta encoding.
+        # No delta decoding.
         # No additional processing of result_tensor.
 
         return (
