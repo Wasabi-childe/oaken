@@ -3,8 +3,8 @@ from typing import Optional
 from .huffman import HuffmanCodec
 
 class OakenQuantizer:
-    QUANTIZE_BITS = 8
-    OUTLIER_BITS = 9
+    QUANTIZE_BITS = 4
+    OUTLIER_BITS = 5
     FLOAT_TOLERANCE = 1e-6
     
     @classmethod
