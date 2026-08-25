@@ -28,7 +28,6 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 args.quant_outlier,
                 use_group_shift=True,
             )
-            tensor = MultiThresholdTokenwiseQuantizer.delta_decode(tensor)
             sparsity_information["value"][i] = [sum(x) for x in zip(sparsity_information["value"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
 
@@ -49,7 +48,6 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 args.quant_outlier,
                 use_group_shift=True,
             )
-            tensor = MultiThresholdTokenwiseQuantizer.delta_decode(tensor)
             sparsity_information["key"][i] = [sum(x) for x in zip(sparsity_information["key"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
 
