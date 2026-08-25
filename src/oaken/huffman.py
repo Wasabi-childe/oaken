@@ -440,3 +440,41 @@ if __name__ == "__main__":
     print(
         decoded == test_symbols
     )
+
+
+    @staticmethod
+    def measure_compression(symbols, bits_per_symbol):
+        """
+        Measure Huffman compression without changing the input tensor.
+        """
+    
+        if hasattr(symbols, "detach"):
+            symbols = (
+                symbols.detach()
+                .cpu()
+                .to(torch.int32)
+                .flatten()
+                .tolist()
+            )
+        else:
+            symbols = list(symbols)
+    
+        if len(symbols) == 0:
+            return {
+                "original_bits": 0,
+                "compressed_bits": 0,
+                "compression_ratio": 0,
+                "memory_reduction": 0,
+            }
+    
+        result = HuffmanCodec.compress(
+            symbols=symbols,
+            bits_per_symbol=bits_per_symbol
+        )
+    
+        return {
+            "original_bits": result["original_bits"],
+            "compressed_bits": result["compressed_bits"],
+            "compression_ratio": result["compression_ratio"],
+            "memory_reduction": result["memory_reduction"],
+        }
