@@ -1,3 +1,7 @@
+import torch
+from typing import Optional
+from collections import Counter
+import heapq
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
     @classmethod
