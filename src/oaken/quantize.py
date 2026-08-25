@@ -1,9 +1,10 @@
 import torch
 from typing import Optional
+from .huffman import HuffmanCodec
 
 class OakenQuantizer:
-    QUANTIZE_BITS = 4
-    OUTLIER_BITS = 5
+    QUANTIZE_BITS = 8
+    OUTLIER_BITS = 9
     FLOAT_TOLERANCE = 1e-6
     
     @classmethod
@@ -41,12 +42,46 @@ class OakenQuantizer:
         return group_tensors, group_masks
     
     @staticmethod
-    def uniform_quantization_threshold(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
+    def uniform_quantization_threshold(
+        tensor,
+        bits: int,
+        minval: torch.Tensor,
+        maxval: torch.Tensor,
+        return_indices: bool = False
+    ):
         rangeval = maxval - minval
+    
+        # Avoid division by zero
+        rangeval = torch.where(
+            rangeval == 0,
+            torch.ones_like(rangeval),
+            rangeval
+        )
+    
         qx = (2 ** bits - 1) / rangeval
         offset = minval * qx
-        quantized = torch.round(qx * tensor - offset)
-        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
+    
+        # Actual integer quantization indices
+        quantized = torch.round(
+            qx * tensor - offset
+        )
+    
+        quantized = torch.nan_to_num(
+            quantized,
+            nan=2 ** bits - 1
+        )
+    
+        # Keep indices within valid range
+        quantized = torch.clamp(
+            quantized,
+            0,
+            2 ** bits - 1
+        )
+    
+        if return_indices:
+            return quantized.to(torch.int32)
+    
+        # Normal Oaken behavior: dequantize back to FP
         return (quantized + offset) / qx
 
     @staticmethod
@@ -54,6 +89,31 @@ class OakenQuantizer:
         maxval = torch.max(tensor).cpu().item()
         minval = torch.min(tensor).cpu().item()
         return OakenQuantizer.uniform_quantization_threshold(tensor, bits, minval, maxval)
+
+    @staticmethod
+    def huffman_test(
+        tensor,
+        bits: int
+    ):
+        maxval = torch.max(tensor).cpu().item()
+        minval = torch.min(tensor).cpu().item()
+    
+        quantized_indices = (
+            OakenQuantizer.uniform_quantization_threshold(
+                tensor,
+                bits,
+                minval,
+                maxval,
+                return_indices=True
+            )
+        )
+    
+        result = HuffmanCodec.measure_compression(
+            quantized_indices,
+            bits_per_symbol=bits
+        )
+    
+        return result
     
     @classmethod
     def downsample_mantissa(cls, tensor):
