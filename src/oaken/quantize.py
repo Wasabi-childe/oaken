@@ -1,14 +1,25 @@
 import torch
+import heapq
+from collections import Counter
 from typing import Optional
+
 
 class OakenQuantizer:
     QUANTIZE_BITS = 8
     OUTLIER_BITS = 9
     FLOAT_TOLERANCE = 1e-6
-    
+
     @classmethod
-    def get_outlier_threshold(cls, input_tensor: torch.Tensor, threshold_lower: float, threshold_upper: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        outlier_mask = torch.logical_or(input_tensor <= threshold_lower, threshold_upper <= input_tensor)
+    def get_outlier_threshold(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lower: float,
+        threshold_upper: float
+    ):
+        outlier_mask = torch.logical_or(
+            input_tensor <= threshold_lower,
+            threshold_upper <= input_tensor
+        )
 
         outlier = input_tensor * outlier_mask
         inlier = input_tensor * ~outlier_mask
@@ -16,49 +27,220 @@ class OakenQuantizer:
         return inlier, outlier, outlier_mask
 
     @classmethod
-    def get_multigroup_threshold(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        group_masks = list()
-        group_tensors = list()
+    def get_multigroup_threshold(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float]
+    ):
+        group_masks = []
+        group_tensors = []
+
         prev_thr_low, prev_thr_up = None, None
-        for idx, (thr_low, thr_up) in enumerate(zip(threshold_lowers, threshold_uppers)):
-            if idx == len(threshold_lowers) - 1: 
-                # Inner-most Group
-                group_masks.append(mask := torch.logical_and(input_tensor > prev_thr_low, input_tensor < prev_thr_up))
-            elif (prev_thr_low is not None) and (prev_thr_up is not None):
-                group_masks.append(mask := torch.logical_or(
-                    torch.logical_and(prev_thr_low < input_tensor, input_tensor <= thr_low),
-                    torch.logical_and(thr_up <= input_tensor, input_tensor < prev_thr_up))
+
+        for idx, (thr_low, thr_up) in enumerate(
+            zip(threshold_lowers, threshold_uppers)
+        ):
+
+            if idx == len(threshold_lowers) - 1:
+
+                mask = torch.logical_and(
+                    input_tensor > prev_thr_low,
+                    input_tensor < prev_thr_up
                 )
+
+            elif (
+                prev_thr_low is not None
+                and prev_thr_up is not None
+            ):
+
+                mask = torch.logical_or(
+                    torch.logical_and(
+                        prev_thr_low < input_tensor,
+                        input_tensor <= thr_low
+                    ),
+                    torch.logical_and(
+                        thr_up <= input_tensor,
+                        input_tensor < prev_thr_up
+                    )
+                )
+
             else:
-                # Outer-most Group
-                group_masks.append(mask := torch.logical_or(               input_tensor <= thr_low, thr_up <= input_tensor))
+
+                mask = torch.logical_or(
+                    input_tensor <= thr_low,
+                    thr_up <= input_tensor
+                )
+
+            group_masks.append(mask)
+            group_tensors.append(input_tensor * mask)
+
             prev_thr_low = thr_low
             prev_thr_up = thr_up
 
-            group_tensors.append(input_tensor * mask)
-
-        assert(len(threshold_lowers) == len(threshold_uppers) == len(group_tensors) == len(group_masks))
         return group_tensors, group_masks
-    
+
+    # ============================================================
+    # QUANTIZATION
+    # ============================================================
+
     @staticmethod
-    def uniform_quantization_threshold(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
+    def uniform_quantization_threshold(
+        tensor,
+        bits: int,
+        minval: torch.Tensor,
+        maxval: torch.Tensor
+    ):
+
         rangeval = maxval - minval
+
         qx = (2 ** bits - 1) / rangeval
         offset = minval * qx
-        quantized = torch.round(qx * tensor - offset)
-        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
+
+        # Integer quantization indices
+        quantized = torch.round(
+            qx * tensor - offset
+        )
+
+        quantized = torch.nan_to_num(
+            quantized,
+            nan=2 ** bits - 1
+        )
+
+        # ========================================================
+        # HUFFMAN MEASUREMENT
+        # ========================================================
+
+        # These are the ACTUAL quantization indices.
+        symbols = quantized.to(torch.int32)
+
+        encoded_bits, codes = OakenQuantizer.huffman_encode_tensor(
+            symbols
+        )
+
+        original_bits = symbols.numel() * bits
+        huffman_bits = len(encoded_bits)
+
+        if huffman_bits > 0:
+
+            compression_ratio = (
+                original_bits / huffman_bits
+            )
+
+            memory_reduction = (
+                (1 - huffman_bits / original_bits)
+                * 100
+            )
+
+            print(
+                f"Huffman ({bits}-bit): "
+                f"{original_bits} -> {huffman_bits} bits | "
+                f"Compression: {compression_ratio:.3f}x | "
+                f"Reduction: {memory_reduction:.2f}%"
+            )
+
+        # ========================================================
+        # EXISTING OAKEN BEHAVIOR
+        # ========================================================
+
+        # Dequantization is still performed here so the rest
+        # of Oaken continues receiving FP16 values.
         return (quantized + offset) / qx
 
     @staticmethod
     def uniform_quantization(tensor, bits: int):
+
         maxval = torch.max(tensor).cpu().item()
         minval = torch.min(tensor).cpu().item()
-        return OakenQuantizer.uniform_quantization_threshold(tensor, bits, minval, maxval)
-    
+
+        return OakenQuantizer.uniform_quantization_threshold(
+            tensor,
+            bits,
+            minval,
+            maxval
+        )
+
+    # ============================================================
+    # HUFFMAN
+    # ============================================================
+
+    @staticmethod
+    def huffman_encode_tensor(tensor):
+
+        values = (
+            tensor.detach()
+            .cpu()
+            .to(torch.int32)
+            .flatten()
+            .tolist()
+        )
+
+        if len(values) == 0:
+            return "", {}
+
+        frequencies = Counter(values)
+
+        heap = [
+            [freq, [[symbol, ""]]]
+            for symbol, freq in frequencies.items()
+        ]
+
+        heapq.heapify(heap)
+
+        # Single-symbol case
+        if len(heap) == 1:
+
+            symbol = heap[0][1][0][0]
+
+            codes = {
+                symbol: "0"
+            }
+
+        else:
+
+            while len(heap) > 1:
+
+                low = heapq.heappop(heap)
+                high = heapq.heappop(heap)
+
+                for item in low[1]:
+                    item[1] = "0" + item[1]
+
+                for item in high[1]:
+                    item[1] = "1" + item[1]
+
+                merged = [
+                    low[0] + high[0],
+                    low[1] + high[1]
+                ]
+
+                heapq.heappush(
+                    heap,
+                    merged
+                )
+
+            codes = {
+                symbol: code
+                for symbol, code in heap[0][1]
+            }
+
+        encoded = "".join(
+            codes[x]
+            for x in values
+        )
+
+        return encoded, codes
+
     @classmethod
     def downsample_mantissa(cls, tensor):
+
         int16_tensor = tensor.view(torch.int16)
-        truncated = int16_tensor & 0b1_11111_1110_0000_00
+
+        truncated = (
+            int16_tensor
+            & 0b1_11111_1110_0000_00
+        )
+
         return truncated.view(torch.float16)
 
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
