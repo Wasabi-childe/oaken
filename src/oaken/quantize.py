@@ -45,18 +45,30 @@ class OakenQuantizer:
     def uniform_quantization_threshold(
         tensor,
         bits: int,
-        minval: torch.Tensor,
-        maxval: torch.Tensor,
+        minval,
+        maxval,
         return_indices: bool = False
     ):
+        # Convert scalar min/max to tensors on the same device
+        if not torch.is_tensor(minval):
+            minval = torch.tensor(
+                minval,
+                device=tensor.device,
+                dtype=tensor.dtype
+            )
+    
+        if not torch.is_tensor(maxval):
+            maxval = torch.tensor(
+                maxval,
+                device=tensor.device,
+                dtype=tensor.dtype
+            )
+    
         rangeval = maxval - minval
     
         # Avoid division by zero
-        rangeval = torch.where(
-            rangeval == 0,
-            torch.ones_like(rangeval),
-            rangeval
-        )
+        if torch.all(rangeval == 0):
+            rangeval = torch.ones_like(rangeval)
     
         qx = (2 ** bits - 1) / rangeval
         offset = minval * qx
@@ -78,10 +90,11 @@ class OakenQuantizer:
             2 ** bits - 1
         )
     
+        # For Huffman: return actual integer symbols
         if return_indices:
             return quantized.to(torch.int32)
     
-        # Normal Oaken behavior: dequantize back to FP
+        # Normal Oaken behavior: return dequantized FP values
         return (quantized + offset) / qx
 
     @staticmethod
