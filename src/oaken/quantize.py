@@ -50,6 +50,26 @@ class OakenQuantizer:
         return (quantized + offset) / qx
 
     @staticmethod
+    def uniform_quantization_indices(tensor, bits, minval, maxval):
+        levels = 2 ** bits - 1
+        rangeval = maxval - minval
+    
+        qx = levels / rangeval
+        offset = minval * qx
+    
+        indices = torch.round(qx * tensor - offset)
+        indices = torch.nan_to_num(
+            indices,
+            nan=levels,
+            posinf=levels,
+            neginf=0
+        )
+    
+        indices = torch.clamp(indices, 0, levels)
+    
+        return indices.to(torch.uint8)
+
+    @staticmethod
     def uniform_quantization(tensor, bits: int):
         maxval = torch.max(tensor).cpu().item()
         minval = torch.min(tensor).cpu().item()
@@ -65,14 +85,47 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
                     quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
-        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+        grouped_tensors, masks = cls.get_multigroup_threshold(
+            input_tensor,
+            threshold_lowers,
+            threshold_uppers
+        )
+        
+        result_tensor = torch.zeros_like(input_tensor).half()
+        
+        quant_indices = torch.zeros_like(
+            input_tensor,
+            dtype=torch.uint8
+        )  
 
         if quantize_outlier:
             # Quantize inner-most group
-            minval_tensor = torch.min(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-1] = cls.uniform_quantization_threshold(grouped_tensors[-1], cls.OUTLIER_BITS, minval_tensor, maxval_tensor)
+            minval_tensor = torch.min(
+                grouped_tensors[-1], dim=-1
+            ).values.unsqueeze(-1)
+            
+            maxval_tensor = torch.max(
+                grouped_tensors[-1], dim=-1
+            ).values.unsqueeze(-1)
+            
+            # Get INTEGER quantization indices from the ORIGINAL group
+            group_indices = cls.uniform_quantization_indices(
+                grouped_tensors[-1],
+                cls.OUTLIER_BITS,
+                minval_tensor,
+                maxval_tensor
+            )
+            
+            # Save them only where this group exists
+            quant_indices[masks[-1]] = group_indices[masks[-1]]
+            
+            # Reconstruct FP16 values for normal Oaken operation
+            grouped_tensors[-1] = cls.uniform_quantization_threshold(
+                grouped_tensors[-1],
+                cls.OUTLIER_BITS,
+                minval_tensor,
+                maxval_tensor
+            )
 
             # Quantize outer groups
             for idx in range(len(threshold_lowers) - 1):
@@ -89,9 +142,35 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     lower_outlier -= threshold_lower_tensor
 
                 if idx == len(threshold_lowers) - 2:
-                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.QUANTIZE_BITS)
+                    bits = cls.QUANTIZE_BITS
                 else:
-                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.OUTLIER_BITS)
+                    bits = cls.OUTLIER_BITS
+                
+                combined = (
+                    higher_outlier * higher_mask
+                    + lower_outlier * lower_mask
+                )
+                
+                # Get integer indices BEFORE reconstruction
+                minval = torch.min(combined, dim=-1).values.unsqueeze(-1)
+                maxval = torch.max(combined, dim=-1).values.unsqueeze(-1)
+                
+                group_indices = cls.uniform_quantization_indices(
+                    combined,
+                    bits,
+                    minval,
+                    maxval
+                )
+                
+                quant_indices[masks[idx]] = group_indices[masks[idx]]
+                
+                # Reconstruct values for normal Oaken operation
+                total_outlier = cls.uniform_quantization_threshold(
+                    combined,
+                    bits,
+                    minval,
+                    maxval
+                )
 
                 higher_outlier = total_outlier * higher_mask
                 lower_outlier = total_outlier * lower_mask
@@ -114,4 +193,9 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         heat_map = None
 
         val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
-        return (result_tensor, val_frac, heat_map)
+        return (
+        result_tensor,
+        val_frac,
+        heat_map,
+        quant_indices
+    )
