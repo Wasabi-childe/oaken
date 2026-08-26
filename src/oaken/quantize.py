@@ -61,6 +61,29 @@ class OakenQuantizer:
         truncated = int16_tensor & 0b1_11111_1110_0000_00
         return truncated.view(torch.float16)
 
+    # ---------------- NEW: same math as uniform_quantization_threshold, but also returns the raw integer codes ----------------
+    @staticmethod
+    def uniform_quantization_threshold_codes(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
+        rangeval = maxval - minval
+        qx = (2 ** bits - 1) / rangeval
+        offset = minval * qx
+        quantized = torch.round(qx * tensor - offset)
+        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
+        quantized = torch.clamp(quantized, 0, 2 ** bits - 1)  # ensures codes fit exactly in `bits` bits
+        dequantized = (quantized + offset) / qx
+        # codes are stored compactly: 4-bit values fit in uint8, 5-bit values fit in uint8 too
+        codes = quantized.to(torch.uint8)
+        return dequantized, codes, qx, offset
+
+    # ---------------- NEW: same as uniform_quantization, but also returns codes + qx/offset ----------------
+    @staticmethod
+    def uniform_quantization_codes(tensor, bits: int):
+        maxval = torch.max(tensor).cpu().item()
+        minval = torch.min(tensor).cpu().item()
+        dequantized, codes, qx, offset = OakenQuantizer.uniform_quantization_threshold_codes(tensor, bits, minval, maxval)
+        return dequantized, codes, qx, offset, minval, maxval
+
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
@@ -116,56 +139,107 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
         return (result_tensor, val_frac, heat_map)
 
-    # ---------------- NEW: capture quantized K/V to a .pt file ----------------
+    # ---------------- NEW: mirrors downsample(), but also returns the true integer codes ----------------
     @classmethod
-    def capture_kv_to_file(cls, k_tensor: torch.Tensor, v_tensor: torch.Tensor,
-                            threshold_lowers: list[float], threshold_uppers: list[float],
-                            quantize_outlier: bool = False, use_group_shift: bool = True,
-                            save_path: str = "quantized_kv.pt"):
+    def downsample_with_codes(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
+                               quantize_outlier: bool = False, use_group_shift: bool = True):
         """
-        Runs downsample() on K and V separately and saves the quantized
-        results (plus metadata) to a .pt file for later use (e.g. Huffman).
-        """
-        k_quant, k_val_frac, _ = cls.downsample(
-            k_tensor, threshold_lowers, threshold_uppers, quantize_outlier, use_group_shift
-        )
-        v_quant, v_val_frac, _ = cls.downsample(
-            v_tensor, threshold_lowers, threshold_uppers, quantize_outlier, use_group_shift
-        )
+        Same behavior/output as downsample() for (result_tensor, val_frac, heat_map),
+        but additionally returns `codes_info`: a dict describing the actual integer
+        quantization codes for every group that got quantized, plus what's needed
+        to dequantize them back (qx, offset, bits, mask).
 
-        payload = {
-            "k": k_quant.cpu(),
-            "v": v_quant.cpu(),
-            "k_val_frac": k_val_frac,
-            "v_val_frac": v_val_frac,
-            "threshold_lowers": threshold_lowers,
-            "threshold_uppers": threshold_uppers,
-            "quantize_outlier": quantize_outlier,
-            "use_group_shift": use_group_shift,
+        codes_info structure:
+        {
+            "<group_label>": {
+                "codes": torch.uint8 tensor (same shape as that group),
+                "bits": int,
+                "qx": tensor or float,
+                "offset": tensor or float,
+                "mask": bool tensor marking which elements belong to this group
+            },
+            ...
         }
-        torch.save(payload, save_path)
+        """
+        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
+        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+        codes_info = {}
 
-        print(f"Saved quantized K/V to {save_path}")
-        print(f"  k shape: {tuple(k_quant.shape)}, dtype: {k_quant.dtype}")
-        print(f"  v shape: {tuple(v_quant.shape)}, dtype: {v_quant.dtype}")
+        if quantize_outlier:
+            # Quantize inner-most group
+            minval_tensor = torch.min(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
+            maxval_tensor = torch.max(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
+            dequant, codes, qx, offset = cls.uniform_quantization_threshold_codes(
+                grouped_tensors[-1], cls.OUTLIER_BITS, minval_tensor, maxval_tensor
+            )
+            grouped_tensors[-1] = dequant
+            codes_info["inner"] = {
+                "codes": codes.cpu(),
+                "bits": cls.OUTLIER_BITS,
+                "qx": qx.cpu() if torch.is_tensor(qx) else qx,
+                "offset": offset.cpu() if torch.is_tensor(offset) else offset,
+                "mask": masks[-1].cpu(),
+            }
 
-        return payload
+            # Quantize outer groups
+            for idx in range(len(threshold_lowers) - 1):
+                threshold_lower_tensor = torch.tensor(threshold_lowers[idx]).to(input_tensor.device).half()
+                threshold_upper_tensor = torch.tensor(threshold_uppers[idx]).to(input_tensor.device).half()
 
+                higher_mask = grouped_tensors[idx] > 0
+                lower_mask = grouped_tensors[idx] < 0
+                higher_outlier = grouped_tensors[idx] * higher_mask
+                lower_outlier = grouped_tensors[idx] * lower_mask
 
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+                if use_group_shift:
+                    higher_outlier -= threshold_upper_tensor
+                    lower_outlier -= threshold_lower_tensor
 
-    # Replace these with your real K/V tensors from the model
-    k_tensor = torch.randn(32, 128, 64, device=device).half()
-    v_tensor = torch.randn(32, 128, 64, device=device).half()
+                bits_used = cls.QUANTIZE_BITS if idx == len(threshold_lowers) - 2 else cls.OUTLIER_BITS
+                combined = higher_outlier * higher_mask + lower_outlier * lower_mask
+                dequant, codes, qx, offset, minval, maxval = cls.uniform_quantization_codes(combined, bits_used)
+                total_outlier = dequant
 
-    threshold_lowers = [-3.0, -1.0]
-    threshold_uppers = [3.0, 1.0]
+                codes_info[f"outer_{idx}"] = {
+                    "codes": codes.cpu(),
+                    "bits": bits_used,
+                    "qx": qx,
+                    "offset": offset,
+                    "mask": (higher_mask | lower_mask).cpu(),
+                    "use_group_shift": use_group_shift,
+                    "threshold_lower": threshold_lowers[idx],
+                    "threshold_upper": threshold_uppers[idx],
+                    "higher_mask": higher_mask.cpu(),
+                    "lower_mask": lower_mask.cpu(),
+                }
 
-    MultiThresholdTokenwiseQuantizer.capture_kv_to_file(
-        k_tensor, v_tensor,
-        threshold_lowers, threshold_uppers,
-        quantize_outlier=False, use_group_shift=True,
-        save_path="quantized_kv.pt"
-    )
+                higher_outlier = total_outlier * higher_mask
+                lower_outlier = total_outlier * lower_mask
+                
+                if use_group_shift:
+                    higher_outlier += threshold_upper_tensor
+                    lower_outlier += threshold_lower_tensor
+
+                grouped_tensors[idx] = (higher_outlier * higher_mask) + (lower_outlier * lower_mask)
+        else:
+            # Quantize middle_group
+            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
+            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
+            dequant, codes, qx, offset = cls.uniform_quantization_threshold_codes(
+                grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor
+            )
+            grouped_tensors[-2] = dequant
+            codes_info["middle"] = {
+                "codes": codes.cpu(),
+                "bits": cls.QUANTIZE_BITS,
+                "qx": qx.cpu() if torch.is_tensor(qx) else qx,
+                "offset": offset.cpu() if torch.is_tensor(offset) else offset,
+                "mask": masks[-2].cpu(),
+            }
+
+        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
+            result_tensor += tensor * mask
+        heat_map = None
+
+        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
+        return (result_tensor, val_frac, heat_map, codes_info)
