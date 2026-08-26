@@ -21,12 +21,13 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         value_counter = 0
 
         def tokenwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
-                output,
-                quantizer_stat["value"]["lower_threshold"][i],
-                quantizer_stat["value"]["upper_threshold"][i],
-                args.quant_outlier,
-                use_group_shift=True,
+        quantized_tensor, val_frac, _, quant_indices = \
+            MultiThresholdTokenwiseQuantizer.downsample(
+                input_tensor,
+                threshold_lowers,
+                threshold_uppers,
+                quantize_outlier=True,
+                use_group_shift=True
             )
             sparsity_information["value"][i] = [sum(x) for x in zip(sparsity_information["value"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
@@ -41,13 +42,14 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
 
         def channelwise_quantize_activation_hook(i, module, input, output):
             #tensor, sparsity, heatmap = MultiThresholdChannelwiseQuantizer.downsample( #
-            tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample( #
-                output,
-                quantizer_stat["key"]["lower_threshold"][i],
-                quantizer_stat["key"]["upper_threshold"][i],
-                args.quant_outlier,
-                use_group_shift=True,
-            )
+            quantized_tensor, val_frac, _, quant_indices = \
+                MultiThresholdTokenwiseQuantizer.downsample(
+                    input_tensor,
+                    threshold_lowers,
+                    threshold_uppers,
+                    quantize_outlier=True,
+                    use_group_shift=True
+                )
             sparsity_information["key"][i] = [sum(x) for x in zip(sparsity_information["key"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
 
