@@ -14,7 +14,7 @@ from src.oaken.quantize import *
 
 
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
-
+    print(">>> multi_group_oaken_main STARTED")
     # ============================================================
     # LOAD QUANTIZER STATISTICS
     # ============================================================
