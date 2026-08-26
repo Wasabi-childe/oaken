@@ -18,7 +18,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             "counter": [0.0 for j in range(n_layer)]
         }
 
-        # ---------------- NEW: storage for captured quantized K/V ----------------
+        # ---------------- NEW: storage for captured quantized K/V codes ----------------
         kv_capture = {
             "key": [None for _ in range(n_layer)],
             "value": [None for _ in range(n_layer)],
@@ -28,7 +28,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         value_counter = 0
 
         def tokenwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
+            tensor, sparsity, heatmap, codes_info = MultiThresholdTokenwiseQuantizer.downsample_with_codes(
                 output,
                 quantizer_stat["value"]["lower_threshold"][i],
                 quantizer_stat["value"]["upper_threshold"][i],
@@ -38,8 +38,8 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             sparsity_information["value"][i] = [sum(x) for x in zip(sparsity_information["value"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
 
-            # ---------------- NEW: capture latest quantized value tensor for this layer ----------------
-            kv_capture["value"][i] = tensor.detach().half().cpu()
+            # ---------------- NEW: capture latest quantized codes (not dequantized fp16) for this layer ----------------
+            kv_capture["value"][i] = codes_info
 
             # nonlocal value_counter
             # if value_counter < 10:
@@ -51,7 +51,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
 
         def channelwise_quantize_activation_hook(i, module, input, output):
             #tensor, sparsity, heatmap = MultiThresholdChannelwiseQuantizer.downsample( #
-            tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample( #
+            tensor, sparsity, heatmap, codes_info = MultiThresholdTokenwiseQuantizer.downsample_with_codes( #
                 output,
                 quantizer_stat["key"]["lower_threshold"][i],
                 quantizer_stat["key"]["upper_threshold"][i],
@@ -61,8 +61,8 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             sparsity_information["key"][i] = [sum(x) for x in zip(sparsity_information["key"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
 
-            # ---------------- NEW: capture latest quantized key tensor for this layer ----------------
-            kv_capture["key"][i] = tensor.detach().half().cpu()
+            # ---------------- NEW: capture latest quantized codes (not dequantized fp16) for this layer ----------------
+            kv_capture["key"][i] = codes_info
 
             # nonlocal key_counter
             # if key_counter < 10:
@@ -78,10 +78,10 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         
         runner(args, model, tokenizer, device)
 
-        # ---------------- NEW: save captured quantized K/V to a .pt file ----------------
+        # ---------------- NEW: save captured quantized K/V codes to a .pt file ----------------
         kv_save_path = getattr(args, "kv_capture_path", "quantized_kv.pt")
         torch.save(kv_capture, kv_save_path)
-        print(f"Saved quantized K/V tensors from all layers to {kv_save_path}")
+        print(f"Saved quantized K/V codes from all layers to {kv_save_path}")
 
         key_sparsity = []
         value_sparsity = []
@@ -128,7 +128,12 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
             sparsity_information["value"][i] += sparsity
             sparsity_information["counter"][i] += 0.5
 
-            # ---------------- NEW: capture latest quantized value tensor for this layer ----------------
+            # ---------------- NEW ----------------
+            # NOTE: TokenwiseQuantizer.downsample() here does not return integer
+            # codes (only MultiThresholdTokenwiseQuantizer.downsample_with_codes does).
+            # Capturing the dequantized fp16 tensor as before; if you need true
+            # integer codes for TokenwiseQuantizer/ChannelwiseQuantizer as well,
+            # they'd need the same kind of *_with_codes addition made to them.
             kv_capture["value"][i] = tensor.detach().half().cpu()
 
             return tensor.half()
@@ -145,7 +150,7 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
             sparsity_information["key"][i] += sparsity
             sparsity_information["counter"][i] += 0.5
 
-            # ---------------- NEW: capture latest quantized key tensor for this layer ----------------
+            # ---------------- NEW ----------------
             kv_capture["key"][i] = tensor.detach().half().cpu()
 
             return tensor.half()
@@ -159,7 +164,7 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
     
     runner(args, model, tokenizer, device)
 
-    # ---------------- NEW: save captured quantized K/V to a .pt file ----------------
+    # ---------------- NEW: save captured K/V to a .pt file ----------------
     kv_save_path = getattr(args, "kv_capture_path", "quantized_kv.pt")
     torch.save(kv_capture, kv_save_path)
     print(f"Saved quantized K/V tensors from all layers to {kv_save_path}")
