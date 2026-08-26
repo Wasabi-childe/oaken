@@ -1,14 +1,24 @@
 import torch
 from typing import Optional
 
+
 class OakenQuantizer:
     QUANTIZE_BITS = 4
     OUTLIER_BITS = 5
     FLOAT_TOLERANCE = 1e-6
-    
+
     @classmethod
-    def get_outlier_threshold(cls, input_tensor: torch.Tensor, threshold_lower: float, threshold_upper: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        outlier_mask = torch.logical_or(input_tensor <= threshold_lower, threshold_upper <= input_tensor)
+    def get_outlier_threshold(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lower: float,
+        threshold_upper: float
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        outlier_mask = torch.logical_or(
+            input_tensor <= threshold_lower,
+            threshold_upper <= input_tensor
+        )
 
         outlier = input_tensor * outlier_mask
         inlier = input_tensor * ~outlier_mask
@@ -16,186 +26,561 @@ class OakenQuantizer:
         return inlier, outlier, outlier_mask
 
     @classmethod
-    def get_multigroup_threshold(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        group_masks = list()
-        group_tensors = list()
-        prev_thr_low, prev_thr_up = None, None
-        for idx, (thr_low, thr_up) in enumerate(zip(threshold_lowers, threshold_uppers)):
-            if idx == len(threshold_lowers) - 1: 
-                # Inner-most Group
-                group_masks.append(mask := torch.logical_and(input_tensor > prev_thr_low, input_tensor < prev_thr_up))
-            elif (prev_thr_low is not None) and (prev_thr_up is not None):
-                group_masks.append(mask := torch.logical_or(
-                    torch.logical_and(prev_thr_low < input_tensor, input_tensor <= thr_low),
-                    torch.logical_and(thr_up <= input_tensor, input_tensor < prev_thr_up))
+    def get_multigroup_threshold(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float]
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+
+        group_masks = []
+        group_tensors = []
+
+        prev_thr_low = None
+        prev_thr_up = None
+
+        for idx, (thr_low, thr_up) in enumerate(
+            zip(threshold_lowers, threshold_uppers)
+        ):
+
+            if idx == len(threshold_lowers) - 1:
+
+                # Inner-most group
+                mask = torch.logical_and(
+                    input_tensor > prev_thr_low,
+                    input_tensor < prev_thr_up
                 )
+
+            elif (
+                prev_thr_low is not None
+                and prev_thr_up is not None
+            ):
+
+                # Middle group
+                mask = torch.logical_or(
+                    torch.logical_and(
+                        prev_thr_low < input_tensor,
+                        input_tensor <= thr_low
+                    ),
+                    torch.logical_and(
+                        thr_up <= input_tensor,
+                        input_tensor < prev_thr_up
+                    )
+                )
+
             else:
-                # Outer-most Group
-                group_masks.append(mask := torch.logical_or(               input_tensor <= thr_low, thr_up <= input_tensor))
+
+                # Outer-most group
+                mask = torch.logical_or(
+                    input_tensor <= thr_low,
+                    thr_up <= input_tensor
+                )
+
+            group_masks.append(mask)
+            group_tensors.append(input_tensor * mask)
+
             prev_thr_low = thr_low
             prev_thr_up = thr_up
 
-            group_tensors.append(input_tensor * mask)
+        assert (
+            len(threshold_lowers)
+            == len(threshold_uppers)
+            == len(group_tensors)
+            == len(group_masks)
+        )
 
-        assert(len(threshold_lowers) == len(threshold_uppers) == len(group_tensors) == len(group_masks))
         return group_tensors, group_masks
-    
-    @staticmethod
-    def uniform_quantization_threshold(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
-        rangeval = maxval - minval
-        qx = (2 ** bits - 1) / rangeval
-        offset = minval * qx
-        quantized = torch.round(qx * tensor - offset)
-        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
-        return (quantized + offset) / qx
+
+    # ============================================================
+    # RECONSTRUCTION QUANTIZATION
+    # ============================================================
 
     @staticmethod
-    def uniform_quantization_indices(tensor, bits, minval, maxval):
+    def uniform_quantization_threshold(
+        tensor: torch.Tensor,
+        bits: int,
+        minval,
+        maxval
+    ):
+
         levels = 2 ** bits - 1
+
+        minval = torch.as_tensor(
+            minval,
+            device=tensor.device,
+            dtype=tensor.dtype
+        )
+
+        maxval = torch.as_tensor(
+            maxval,
+            device=tensor.device,
+            dtype=tensor.dtype
+        )
+
         rangeval = maxval - minval
-    
+
+        # Prevent division by zero
+        rangeval = torch.where(
+            torch.abs(rangeval) < OakenQuantizer.FLOAT_TOLERANCE,
+            torch.ones_like(rangeval),
+            rangeval
+        )
+
         qx = levels / rangeval
         offset = minval * qx
-    
-        indices = torch.round(qx * tensor - offset)
-        indices = torch.nan_to_num(
-            indices,
-            nan=levels,
-            posinf=levels,
-            neginf=0
+
+        quantized = torch.round(
+            qx * tensor - offset
         )
-    
-        indices = torch.clamp(indices, 0, levels)
-    
-        return indices.to(torch.uint8)
+
+        quantized = torch.nan_to_num(
+            quantized,
+            nan=float(levels),
+            posinf=float(levels),
+            neginf=0.0
+        )
+
+        quantized = torch.clamp(
+            quantized,
+            0,
+            levels
+        )
+
+        return (quantized + offset) / qx
+
+    # ============================================================
+    # INTEGER QUANTIZATION INDICES
+    # ============================================================
 
     @staticmethod
-    def uniform_quantization(tensor, bits: int):
-        maxval = torch.max(tensor).cpu().item()
-        minval = torch.min(tensor).cpu().item()
-        return OakenQuantizer.uniform_quantization_threshold(tensor, bits, minval, maxval)
-    
+    def uniform_quantization_indices(
+        tensor: torch.Tensor,
+        bits: int,
+        minval,
+        maxval
+    ) -> torch.Tensor:
+
+        """
+        Returns the actual integer quantization indices.
+
+        4-bit -> 0 ... 15
+        5-bit -> 0 ... 31
+        """
+
+        levels = 2 ** bits - 1
+
+        minval = torch.as_tensor(
+            minval,
+            device=tensor.device,
+            dtype=tensor.dtype
+        )
+
+        maxval = torch.as_tensor(
+            maxval,
+            device=tensor.device,
+            dtype=tensor.dtype
+        )
+
+        rangeval = maxval - minval
+
+        # Avoid division by zero
+        safe_range = torch.where(
+            torch.abs(rangeval) < OakenQuantizer.FLOAT_TOLERANCE,
+            torch.ones_like(rangeval),
+            rangeval
+        )
+
+        qx = levels / safe_range
+        offset = minval * qx
+
+        indices = torch.round(
+            qx * tensor - offset
+        )
+
+        indices = torch.nan_to_num(
+            indices,
+            nan=float(levels),
+            posinf=float(levels),
+            neginf=0.0
+        )
+
+        indices = torch.clamp(
+            indices,
+            0,
+            levels
+        )
+
+        return indices.to(torch.uint8)
+
+    # ============================================================
+    # ORIGINAL OAKEN QUANTIZATION
+    # ============================================================
+
+    @staticmethod
+    def uniform_quantization(
+        tensor: torch.Tensor,
+        bits: int
+    ):
+
+        maxval = torch.max(tensor).item()
+        minval = torch.min(tensor).item()
+
+        return OakenQuantizer.uniform_quantization_threshold(
+            tensor,
+            bits,
+            minval,
+            maxval
+        )
+
+    # ============================================================
+    # MANTISSA DOWNSAMPLING
+    # ============================================================
+
     @classmethod
-    def downsample_mantissa(cls, tensor):
+    def downsample_mantissa(
+        cls,
+        tensor: torch.Tensor
+    ):
+
         int16_tensor = tensor.view(torch.int16)
-        truncated = int16_tensor & 0b1_11111_1110_0000_00
+
+        truncated = (
+            int16_tensor
+            & 0b1_11111_1110_0000_00
+        )
+
         return truncated.view(torch.float16)
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
     @classmethod
-    def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
-                    quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-        grouped_tensors, masks = cls.get_multigroup_threshold(
-            input_tensor,
-            threshold_lowers,
-            threshold_uppers
+    def downsample(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float],
+        quantize_outlier: bool = False,
+        use_group_shift: bool = True
+    ):
+
+        grouped_tensors, masks = (
+            cls.get_multigroup_threshold(
+                input_tensor,
+                threshold_lowers,
+                threshold_uppers
+            )
         )
-        
-        result_tensor = torch.zeros_like(input_tensor).half()
-        
+
+        result_tensor = torch.zeros_like(
+            input_tensor
+        ).half()
+
+        # ========================================================
+        # QUANTIZATION INDICES
+        # ========================================================
+
         quant_indices = torch.zeros_like(
             input_tensor,
             dtype=torch.uint8
-        )  
+        )
+
+        # ========================================================
+        # GROUP IDs
+        #
+        # 0 = outer-most group
+        # 1 = next group
+        # ...
+        # last = inner-most group
+        # ========================================================
+
+        group_ids = torch.zeros_like(
+            input_tensor,
+            dtype=torch.uint8
+        )
+
+        # ========================================================
+        # BIT WIDTH PER VALUE
+        #
+        # Stores:
+        # 4 = 4-bit quantization
+        # 5 = 5-bit quantization
+        # ========================================================
+
+        quant_bits = torch.zeros_like(
+            input_tensor,
+            dtype=torch.uint8
+        )
+
+        # ========================================================
+        # QUANTIZE OUTLIERS
+        # ========================================================
 
         if quantize_outlier:
-            # Quantize inner-most group
+
+            # ----------------------------------------------------
+            # INNER-MOST GROUP
+            # ----------------------------------------------------
+
             minval_tensor = torch.min(
-                grouped_tensors[-1], dim=-1
+                grouped_tensors[-1],
+                dim=-1
             ).values.unsqueeze(-1)
-            
+
             maxval_tensor = torch.max(
-                grouped_tensors[-1], dim=-1
+                grouped_tensors[-1],
+                dim=-1
             ).values.unsqueeze(-1)
-            
-            # Get INTEGER quantization indices from the ORIGINAL group
-            group_indices = cls.uniform_quantization_indices(
-                grouped_tensors[-1],
-                cls.OUTLIER_BITS,
-                minval_tensor,
-                maxval_tensor
-            )
-            
-            # Save them only where this group exists
-            quant_indices[masks[-1]] = group_indices[masks[-1]]
-            
-            # Reconstruct FP16 values for normal Oaken operation
-            grouped_tensors[-1] = cls.uniform_quantization_threshold(
-                grouped_tensors[-1],
-                cls.OUTLIER_BITS,
-                minval_tensor,
-                maxval_tensor
+
+            bits = cls.OUTLIER_BITS
+
+            # Get integer indices
+            group_indices = (
+                cls.uniform_quantization_indices(
+                    grouped_tensors[-1],
+                    bits,
+                    minval_tensor,
+                    maxval_tensor
+                )
             )
 
-            # Quantize outer groups
-            for idx in range(len(threshold_lowers) - 1):
-                threshold_lower_tensor = torch.tensor(threshold_lowers[idx]).to(input_tensor.device).half()
-                threshold_upper_tensor = torch.tensor(threshold_uppers[idx]).to(input_tensor.device).half()
+            # Save indices
+            quant_indices[masks[-1]] = (
+                group_indices[masks[-1]]
+            )
 
-                higher_mask = grouped_tensors[idx] > 0
-                lower_mask = grouped_tensors[idx] < 0
-                higher_outlier = grouped_tensors[idx] * higher_mask
-                lower_outlier = grouped_tensors[idx] * lower_mask
+            # Save group ID
+            group_ids[masks[-1]] = (
+                len(threshold_lowers) - 1
+            )
+
+            # Save bit width
+            quant_bits[masks[-1]] = bits
+
+            # Reconstruct FP16 values
+            grouped_tensors[-1] = (
+                cls.uniform_quantization_threshold(
+                    grouped_tensors[-1],
+                    bits,
+                    minval_tensor,
+                    maxval_tensor
+                )
+            )
+
+            # ----------------------------------------------------
+            # OUTER / MIDDLE GROUPS
+            # ----------------------------------------------------
+
+            for idx in range(
+                len(threshold_lowers) - 1
+            ):
+
+                threshold_lower_tensor = torch.tensor(
+                    threshold_lowers[idx],
+                    device=input_tensor.device,
+                    dtype=input_tensor.dtype
+                )
+
+                threshold_upper_tensor = torch.tensor(
+                    threshold_uppers[idx],
+                    device=input_tensor.device,
+                    dtype=input_tensor.dtype
+                )
+
+                higher_mask = (
+                    grouped_tensors[idx] > 0
+                )
+
+                lower_mask = (
+                    grouped_tensors[idx] < 0
+                )
+
+                higher_outlier = (
+                    grouped_tensors[idx]
+                    * higher_mask
+                )
+
+                lower_outlier = (
+                    grouped_tensors[idx]
+                    * lower_mask
+                )
+
+                # ------------------------------------------------
+                # GROUP SHIFT
+                # ------------------------------------------------
 
                 if use_group_shift:
-                    higher_outlier -= threshold_upper_tensor
-                    lower_outlier -= threshold_lower_tensor
 
-                if idx == len(threshold_lowers) - 2:
-                    bits = cls.QUANTIZE_BITS
-                else:
-                    bits = cls.OUTLIER_BITS
-                
+                    higher_outlier = (
+                        higher_outlier
+                        - threshold_upper_tensor
+                    )
+
+                    lower_outlier = (
+                        lower_outlier
+                        - threshold_lower_tensor
+                    )
+
                 combined = (
                     higher_outlier * higher_mask
                     + lower_outlier * lower_mask
                 )
-                
-                # Get integer indices BEFORE reconstruction
-                minval = torch.min(combined, dim=-1).values.unsqueeze(-1)
-                maxval = torch.max(combined, dim=-1).values.unsqueeze(-1)
-                
-                group_indices = cls.uniform_quantization_indices(
-                    combined,
-                    bits,
-                    minval,
-                    maxval
-                )
-                
-                quant_indices[masks[idx]] = group_indices[masks[idx]]
-                
-                # Reconstruct values for normal Oaken operation
-                total_outlier = cls.uniform_quantization_threshold(
-                    combined,
-                    bits,
-                    minval,
-                    maxval
+
+                # ------------------------------------------------
+                # OAKEN BIT WIDTH
+                # ------------------------------------------------
+
+                if (
+                    idx
+                    == len(threshold_lowers) - 2
+                ):
+                    bits = cls.QUANTIZE_BITS
+                else:
+                    bits = cls.OUTLIER_BITS
+
+                # ------------------------------------------------
+                # EXACT SAME MIN/MAX USED FOR QUANTIZATION
+                # ------------------------------------------------
+
+                minval = torch.min(
+                    combined
+                ).item()
+
+                maxval = torch.max(
+                    combined
+                ).item()
+
+                # ------------------------------------------------
+                # GET INTEGER INDICES
+                # ------------------------------------------------
+
+                group_indices = (
+                    cls.uniform_quantization_indices(
+                        combined,
+                        bits,
+                        minval,
+                        maxval
+                    )
                 )
 
-                higher_outlier = total_outlier * higher_mask
-                lower_outlier = total_outlier * lower_mask
-                
+                # Save only this group's values
+                quant_indices[masks[idx]] = (
+                    group_indices[masks[idx]]
+                )
+
+                # Save group ID
+                group_ids[masks[idx]] = idx
+
+                # Save bit width
+                quant_bits[masks[idx]] = bits
+
+                # ------------------------------------------------
+                # RECONSTRUCT
+                # ------------------------------------------------
+
+                total_outlier = (
+                    cls.uniform_quantization_threshold(
+                        combined,
+                        bits,
+                        minval,
+                        maxval
+                    )
+                )
+
+                higher_outlier = (
+                    total_outlier
+                    * higher_mask
+                )
+
+                lower_outlier = (
+                    total_outlier
+                    * lower_mask
+                )
+
+                # ------------------------------------------------
+                # REVERSE GROUP SHIFT
+                # ------------------------------------------------
+
                 if use_group_shift:
-                    higher_outlier += threshold_upper_tensor
-                    lower_outlier += threshold_lower_tensor
 
-                grouped_tensors[idx] = (higher_outlier * higher_mask) + (lower_outlier * lower_mask)
+                    higher_outlier = (
+                        higher_outlier
+                        + threshold_upper_tensor
+                    )
+
+                    lower_outlier = (
+                        lower_outlier
+                        + threshold_lower_tensor
+                    )
+
+                grouped_tensors[idx] = (
+                    higher_outlier * higher_mask
+                    + lower_outlier * lower_mask
+                )
+
+        # ========================================================
+        # NON-OUTLIER MODE
+        # ========================================================
+
         else:
-            # Quantize middle_group
-            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-2] = cls.uniform_quantization_threshold(grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor)
 
-        # heat_map = torch.zeros_like(input_tensor)
-        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
-            result_tensor += tensor * mask
-            # heat_map += idx * mask
+            idx = len(threshold_lowers) - 2
+
+            minval_tensor = torch.min(
+                grouped_tensors[idx],
+                dim=-1
+            ).values.unsqueeze(-1)
+
+            maxval_tensor = torch.max(
+                grouped_tensors[idx],
+                dim=-1
+            ).values.unsqueeze(-1)
+
+            grouped_tensors[idx] = (
+                cls.uniform_quantization_threshold(
+                    grouped_tensors[idx],
+                    cls.QUANTIZE_BITS,
+                    minval_tensor,
+                    maxval_tensor
+                )
+            )
+
+        # ========================================================
+        # REBUILD COMPLETE QUANTIZED TENSOR
+        # ========================================================
+
+        for tensor, mask in zip(
+            grouped_tensors,
+            masks
+        ):
+
+            result_tensor += (
+                tensor * mask
+            )
+
+        # ========================================================
+        # GROUP FRACTIONS
+        # ========================================================
+
+        val_frac = [
+            (
+                torch.count_nonzero(mask)
+                / torch.numel(mask)
+            ).item()
+            for mask in masks
+        ]
+
         heat_map = None
 
-        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
+        # ========================================================
+        # RETURN
+        # ========================================================
+
         return (
-        result_tensor,
-        val_frac,
-        heat_map,
-        quant_indices
-    )
+            result_tensor,
+            val_frac,
+            heat_map,
+            quant_indices,
+            group_ids,
+            quant_bits
+        )
