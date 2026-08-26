@@ -79,7 +79,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         runner(args, model, tokenizer, device)
 
         # ---------------- NEW: save captured quantized K/V codes to a .pt file ----------------
-        kv_save_path = getattr(args, "kv_capture_path", "quantized_kv.pt")
+        kv_save_path = "/content/oaken/quantized_kv.pt"
         torch.save(kv_capture, kv_save_path)
         print(f"Saved quantized K/V codes from all layers to {kv_save_path}")
 
