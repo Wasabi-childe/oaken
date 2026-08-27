@@ -215,7 +215,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                         kv_type,
                         f"outer_{idx}",
                         codes,
-                        mask=masks[idx]
+                        mask=(higher_mask | lower_mask)
                     )
 
                 codes_info[f"outer_{idx}"] = {
