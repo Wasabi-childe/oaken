@@ -21,10 +21,6 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         }
 
         # ---------------- NEW: storage for captured quantized K/V codes ----------------
-        kv_capture = {
-            "key": [None for _ in range(n_layer)],
-            "value": [None for _ in range(n_layer)],
-        }
 
         key_counter = 0
         value_counter = 0
@@ -43,7 +39,6 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             sparsity_information["counter"][i] += 0.5
 
             # ---------------- NEW: capture latest quantized codes (not dequantized fp16) for this layer ----------------
-            kv_capture["value"][i] = codes_info
 
             # nonlocal value_counter
             # if value_counter < 10:
@@ -68,7 +63,6 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             sparsity_information["counter"][i] += 0.5
 
             # ---------------- NEW: capture latest quantized codes (not dequantized fp16) for this layer ----------------
-            kv_capture["key"][i] = codes_info
 
             # nonlocal key_counter
             # if key_counter < 10:
@@ -169,11 +163,21 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
         raise ValueError(f"Model {args.model} not supported.")
     
     runner(args, model, tokenizer, device)
+    print("\nCalibration complete.")
+    huffman_collector.print_summary()
+    
+    codebooks = huffman_collector.build_all_codebooks()
+    
+    print("\n" + "=" * 70)
+    print("HUFFMAN CODEBOOKS")
+    print("=" * 70)
+    
+    for name, codebook in codebooks.items():
+        print(f"\n{name}:")
+        for symbol, code in sorted(codebook.items()):
+            print(f"  {symbol:2d} -> {code}")
 
     # ---------------- NEW: save captured K/V to a .pt file ----------------
-    kv_save_path = getattr(args, "kv_capture_path", "quantized_kv.pt")
-    torch.save(kv_capture, kv_save_path)
-    print(f"Saved quantized K/V tensors from all layers to {kv_save_path}")
 
     key_sparsity = []
     value_sparsity = []
