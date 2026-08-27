@@ -201,6 +201,13 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 dequant, codes, qx, offset, minval, maxval = cls.uniform_quantization_codes(combined, bits_used)
                 total_outlier = dequant
 
+                huffman_collector.update(
+                kv_type,
+                f"outer_{idx}",
+                codes,
+                mask=masks[idx]
+            )
+
                 codes_info[f"outer_{idx}"] = {
                     "codes": codes.cpu(),
                     "bits": bits_used,
