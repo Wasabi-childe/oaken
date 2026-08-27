@@ -1,4 +1,4 @@
-%%writefile /content/oaken/src/oaken/quantize.py
+
 import torch
 from typing import Optional
 
