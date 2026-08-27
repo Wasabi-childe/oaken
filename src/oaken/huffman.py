@@ -5,7 +5,7 @@ from collections import Counter
 class HuffmanCollector:
 
     def __init__(self):
-        # Six possible Oaken groups:
+        # Six Oaken groups:
         #
         # key/inner
         # key/outer_0
@@ -48,7 +48,9 @@ class HuffmanCollector:
 
         # Only one symbol
         if len(counts) == 1:
+
             symbol = next(iter(counts))
+
             return {
                 symbol: "0"
             }
@@ -57,6 +59,7 @@ class HuffmanCollector:
 
         counter = 0
 
+        # Create initial leaf nodes
         for symbol, frequency in counts.items():
 
             heapq.heappush(
@@ -68,10 +71,10 @@ class HuffmanCollector:
 
         next_node = counter
 
-        # Tree:
-        # (left, right)
+        # Internal tree nodes
         trees = {}
 
+        # Build Huffman tree
         while len(heap) > 1:
 
             freq1, _, node1 = heapq.heappop(heap)
@@ -99,10 +102,13 @@ class HuffmanCollector:
 
         def traverse(node, code):
 
+            # Leaf node
             if node in counts:
+
                 codebook[node] = code
                 return
 
+            # Internal node
             left, right = trees[node]
 
             traverse(left, code + "0")
@@ -114,23 +120,32 @@ class HuffmanCollector:
 
     def build_all_codebooks(self):
 
+        """
+        Build a separate Huffman codebook for every
+        Oaken quantization group.
+
+        Total = 6 codebooks.
+        """
+
         codebooks = {}
 
-        # Only these four groups use Huffman
-        huffman_groups = [
+        all_groups = [
             ("key", "inner"),
             ("key", "outer_0"),
+            ("key", "outer_1"),
             ("value", "inner"),
             ("value", "outer_0"),
+            ("value", "outer_1"),
         ]
 
-        for kv_type, group_name in huffman_groups:
+        for kv_type, group_name in all_groups:
 
-            codebooks[f"{kv_type}_{group_name}"] = \
-                self.build_codebook(
-                    kv_type,
-                    group_name
-                )
+            key = f"{kv_type}_{group_name}"
+
+            codebooks[key] = self.build_codebook(
+                kv_type,
+                group_name
+            )
 
         return codebooks
 
@@ -153,17 +168,18 @@ class HuffmanCollector:
                 print(
                     f"{kv_type.upper()} / {group_name}"
                 )
+
                 print(
                     f"Total codes: {total:,}"
                 )
+
                 print(
                     f"Unique codes: {len(counts)}"
                 )
 
                 if total > 0:
 
-                    for symbol, count in \
-                            counts.most_common():
+                    for symbol, count in counts.most_common():
 
                         percentage = \
                             100.0 * count / total
@@ -173,3 +189,24 @@ class HuffmanCollector:
                             f"{count:10,} "
                             f"({percentage:7.3f}%)"
                         )
+
+    def print_codebooks(self, codebooks):
+
+        print()
+        print("=" * 70)
+        print("HUFFMAN CODEBOOKS")
+        print("=" * 70)
+
+        for name, codebook in codebooks.items():
+
+            print()
+            print(f"{name}:")
+
+            for symbol in sorted(codebook):
+
+                print(
+                    f"  {symbol:2d} -> {codebook[symbol]}"
+                )
+
+        print()
+        print(f"Total Huffman codebooks: {len(codebooks)}")
