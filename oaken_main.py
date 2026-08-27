@@ -96,49 +96,58 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             for symbol, code in sorted(codebook.items()):
                 print(f"  {symbol:2d} -> {code}")
 
-        print("\n" + "=" * 70)
-        print("HUFFMAN COMPRESSION ANALYSIS")
+        print()
         print("=" * 70)
-        
+        print("HUFFMAN RESULT")
+        print("=" * 70)
+
+        # ------------------------------------------------------------
+        # Calculate Huffman storage size
+        # ------------------------------------------------------------
+
+        total_values = 0
         total_fixed_bits = 0
         total_huffman_bits = 0
-        
+
         for kv_type in huffman_collector.counts:
             for group_name in huffman_collector.counts[kv_type]:
-        
-                counts = huffman_collector.get_counts(
-                    kv_type,
-                    group_name
-                )
-        
-                if not counts:
-                    continue
-        
+
+                counts = huffman_collector.counts[kv_type][group_name]
+
+                # Number of symbols in this group
+                total_codes = sum(counts.values())
+
+                # Corresponding Huffman codebook
                 codebook_name = f"{kv_type}_{group_name}"
                 codebook = codebooks[codebook_name]
-        
-                total_codes = sum(counts.values())
-        
-                # Fixed-width size
+
+                # Fixed-length representation
+                #
+                # inner       -> 5 bits
+                # outer_0     -> 5 bits
+                # outer_1     -> 4 bits
+                #
+                # We can determine this directly from the number of
+                # unique possible symbols.
                 if group_name == "outer_1":
                     fixed_bits_per_code = 4
                 else:
                     fixed_bits_per_code = 5
-        
+
                 fixed_bits = total_codes * fixed_bits_per_code
-        
-                # Huffman size
+
+                # Huffman bits = frequency × Huffman code length
                 huffman_bits = sum(
                     count * len(codebook[symbol])
                     for symbol, count in counts.items()
                 )
-        
+
                 avg_huffman_bits = huffman_bits / total_codes
-        
+
                 savings = (
                     1 - huffman_bits / fixed_bits
                 ) * 100
-        
+
                 print()
                 print(f"{kv_type.upper()} / {group_name}")
                 print("-" * 50)
@@ -148,42 +157,43 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 print(f"Fixed size:             {fixed_bits / 8 / 1024 / 1024:.4f} MB")
                 print(f"Huffman size:           {huffman_bits / 8 / 1024 / 1024:.4f} MB")
                 print(f"Savings:                {savings:.2f}%")
-        
+
+                total_values += total_codes
                 total_fixed_bits += fixed_bits
                 total_huffman_bits += huffman_bits
-        
+
+        # ------------------------------------------------------------
+        # Overall result
+        # ------------------------------------------------------------
+
+        overall_avg = total_huffman_bits / total_values
+
+        overall_savings = (
+            1 - total_huffman_bits / total_fixed_bits
+        ) * 100
+
         print()
         print("=" * 70)
         print("OVERALL")
         print("=" * 70)
-        
-        overall_avg = total_huffman_bits / sum(
-            sum(
-                huffman_collector.counts[k][g].values()
-                for g in huffman_collector.counts[k]
-            )
-            for k in huffman_collector.counts
-        )
-        
-        overall_savings = (
-            1 - total_huffman_bits / total_fixed_bits
-        ) * 100
-        
+
+        print(f"Total values:           {total_values:,}")
+
         print(
             f"Fixed quantized size:   "
             f"{total_fixed_bits / 8 / 1024 / 1024:.4f} MB"
         )
-        
+
         print(
             f"Huffman size:           "
             f"{total_huffman_bits / 8 / 1024 / 1024:.4f} MB"
         )
-        
+
         print(
             f"Average Huffman rate:   "
             f"{overall_avg:.4f} bits/code"
         )
-        
+
         print(
             f"Overall savings:        "
             f"{overall_savings:.2f}%"
