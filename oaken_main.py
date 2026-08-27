@@ -5,10 +5,12 @@ from statistics import mean
 import torch
 from src.oaken.quantize import *
 import pandas as pd
+from src.oaken.huffman import HuffmanCollector
 
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
+        huffman_collector = HuffmanCollector()
         n_quant_group = quantizer_stat["n_quant_group"]
         n_layer = len(model.get_decoder().layers)
 
@@ -34,6 +36,8 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 quantizer_stat["value"]["upper_threshold"][i],
                 args.quant_outlier,
                 use_group_shift=True,
+                kv_type="value",
+                huffman_collector=huffman_collector,
             )
             sparsity_information["value"][i] = [sum(x) for x in zip(sparsity_information["value"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
@@ -57,6 +61,8 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 quantizer_stat["key"]["upper_threshold"][i],
                 args.quant_outlier,
                 use_group_shift=True,
+                kv_type="key",
+                huffman_collector=huffman_collector,
             )
             sparsity_information["key"][i] = [sum(x) for x in zip(sparsity_information["key"][i], sparsity)]
             sparsity_information["counter"][i] += 0.5
