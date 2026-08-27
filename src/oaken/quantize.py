@@ -143,7 +143,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     # ---------------- NEW: mirrors downsample(), but also returns the true integer codes ----------------
     @classmethod
     def downsample_with_codes(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
-                               quantize_outlier: bool = True, use_group_shift: bool = True):
+                               quantize_outlier: bool = True, use_group_shift: bool = True, huffman_collector=None, kv_type=None):
         """
         Same behavior/output as downsample() for (result_tensor, val_frac, heat_map),
         but additionally returns `codes_info`: a dict describing the actual integer
