@@ -20,10 +20,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             "counter": [0.0 for j in range(n_layer)]
         }
 
-        # ---------------- NEW: storage for captured quantized K/V codes ----------------
 
-        key_counter = 0
-        value_counter = 0
 
         def tokenwise_quantize_activation_hook(i, module, input, output):
             tensor, sparsity, heatmap, codes_info = MultiThresholdTokenwiseQuantizer.downsample_with_codes(
@@ -77,11 +74,30 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             decoder.self_attn.k_proj.register_forward_hook(partial(channelwise_quantize_activation_hook, i))
         
         runner(args, model, tokenizer, device)
+        print("\nCalibration complete.")
+
+        huffman_collector.print_summary()
+        
+        codebooks = huffman_collector.build_all_codebooks()
+        
+        huffman_save_path = "/content/oaken/huffman_codebooks.json"
+        
+        with open(huffman_save_path, "w") as f:
+            json.dump(codebooks, f, indent=2)
+        
+        print(f"Saved Huffman codebooks to {huffman_save_path}")
+        
+        print("\n" + "=" * 70)
+        print("HUFFMAN CODEBOOKS")
+        print("=" * 70)
+        
+        for name, codebook in codebooks.items():
+            print(f"\n{name}:")
+            for symbol, code in sorted(codebook.items()):
+                print(f"  {symbol:2d} -> {code}")
 
         # ---------------- NEW: save captured quantized K/V codes to a .pt file ----------------
-        kv_save_path = "/content/oaken/quantized_kv.pt"
-        torch.save(kv_capture, kv_save_path)
-        print(f"Saved quantized K/V codes from all layers to {kv_save_path}")
+
 
         key_sparsity = []
         value_sparsity = []
@@ -110,11 +126,7 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
     }
 
     # ---------------- NEW: storage for captured quantized K/V ----------------
-    n_layer = len(model.get_decoder().layers)
-    kv_capture = {
-        "key": [None for _ in range(n_layer)],
-        "value": [None for _ in range(n_layer)],
-    }
+
 
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
@@ -134,7 +146,6 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
             # Capturing the dequantized fp16 tensor as before; if you need true
             # integer codes for TokenwiseQuantizer/ChannelwiseQuantizer as well,
             # they'd need the same kind of *_with_codes addition made to them.
-            kv_capture["value"][i] = tensor.detach().half().cpu()
 
             return tensor.half()
             
@@ -151,7 +162,7 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
             sparsity_information["counter"][i] += 0.5
 
             # ---------------- NEW ----------------
-            kv_capture["key"][i] = tensor.detach().half().cpu()
+
 
             return tensor.half()
     
@@ -163,19 +174,7 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
         raise ValueError(f"Model {args.model} not supported.")
     
     runner(args, model, tokenizer, device)
-    print("\nCalibration complete.")
-    huffman_collector.print_summary()
-    
-    codebooks = huffman_collector.build_all_codebooks()
-    
-    print("\n" + "=" * 70)
-    print("HUFFMAN CODEBOOKS")
-    print("=" * 70)
-    
-    for name, codebook in codebooks.items():
-        print(f"\n{name}:")
-        for symbol, code in sorted(codebook.items()):
-            print(f"  {symbol:2d} -> {code}")
+
 
     # ---------------- NEW: save captured K/V to a .pt file ----------------
 
