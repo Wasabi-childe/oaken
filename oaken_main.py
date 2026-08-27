@@ -96,6 +96,99 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             for symbol, code in sorted(codebook.items()):
                 print(f"  {symbol:2d} -> {code}")
 
+        print("\n" + "=" * 70)
+        print("HUFFMAN COMPRESSION ANALYSIS")
+        print("=" * 70)
+        
+        total_fixed_bits = 0
+        total_huffman_bits = 0
+        
+        for kv_type in huffman_collector.counts:
+            for group_name in huffman_collector.counts[kv_type]:
+        
+                counts = huffman_collector.get_counts(
+                    kv_type,
+                    group_name
+                )
+        
+                if not counts:
+                    continue
+        
+                codebook_name = f"{kv_type}_{group_name}"
+                codebook = codebooks[codebook_name]
+        
+                total_codes = sum(counts.values())
+        
+                # Fixed-width size
+                if group_name == "outer_1":
+                    fixed_bits_per_code = 4
+                else:
+                    fixed_bits_per_code = 5
+        
+                fixed_bits = total_codes * fixed_bits_per_code
+        
+                # Huffman size
+                huffman_bits = sum(
+                    count * len(codebook[symbol])
+                    for symbol, count in counts.items()
+                )
+        
+                avg_huffman_bits = huffman_bits / total_codes
+        
+                savings = (
+                    1 - huffman_bits / fixed_bits
+                ) * 100
+        
+                print()
+                print(f"{kv_type.upper()} / {group_name}")
+                print("-" * 50)
+                print(f"Values:                 {total_codes:,}")
+                print(f"Fixed bits/code:        {fixed_bits_per_code}")
+                print(f"Huffman bits/code:      {avg_huffman_bits:.4f}")
+                print(f"Fixed size:             {fixed_bits / 8 / 1024 / 1024:.4f} MB")
+                print(f"Huffman size:           {huffman_bits / 8 / 1024 / 1024:.4f} MB")
+                print(f"Savings:                {savings:.2f}%")
+        
+                total_fixed_bits += fixed_bits
+                total_huffman_bits += huffman_bits
+        
+        print()
+        print("=" * 70)
+        print("OVERALL")
+        print("=" * 70)
+        
+        overall_avg = total_huffman_bits / sum(
+            sum(
+                huffman_collector.counts[k][g].values()
+                for g in huffman_collector.counts[k]
+            )
+            for k in huffman_collector.counts
+        )
+        
+        overall_savings = (
+            1 - total_huffman_bits / total_fixed_bits
+        ) * 100
+        
+        print(
+            f"Fixed quantized size:   "
+            f"{total_fixed_bits / 8 / 1024 / 1024:.4f} MB"
+        )
+        
+        print(
+            f"Huffman size:           "
+            f"{total_huffman_bits / 8 / 1024 / 1024:.4f} MB"
+        )
+        
+        print(
+            f"Average Huffman rate:   "
+            f"{overall_avg:.4f} bits/code"
+        )
+        
+        print(
+            f"Overall savings:        "
+            f"{overall_savings:.2f}%"
+        )
+
         # ---------------- NEW: save captured quantized K/V codes to a .pt file ----------------
 
 
