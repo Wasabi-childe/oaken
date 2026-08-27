@@ -1,483 +1,175 @@
 import heapq
-import torch
 from collections import Counter
 
 
-class HuffmanNode:
-    def __init__(self, frequency, symbol=None, left=None, right=None):
-        self.frequency = frequency
-        self.symbol = symbol
-        self.left = left
-        self.right = right
+class HuffmanCollector:
 
-    def __lt__(self, other):
-        return self.frequency < other.frequency
+    def __init__(self):
+        # Six possible Oaken groups:
+        #
+        # key/inner
+        # key/outer_0
+        # key/outer_1
+        # value/inner
+        # value/outer_0
+        # value/outer_1
 
+        self.counts = {
+            "key": {
+                "inner": Counter(),
+                "outer_0": Counter(),
+                "outer_1": Counter(),
+            },
+            "value": {
+                "inner": Counter(),
+                "outer_0": Counter(),
+                "outer_1": Counter(),
+            }
+        }
 
-class HuffmanCodec:
+    def update(self, kv_type, group_name, codes, mask=None):
 
-    # ============================================================
-    # BUILD HUFFMAN TREE
-    # ============================================================
+        if mask is not None:
+            codes = codes[mask]
 
-    @staticmethod
-    def build_tree(symbols):
-        """
-        Build a Huffman tree from a list of integer symbols.
-        """
+        codes = codes.reshape(-1).cpu().tolist()
 
-        if len(symbols) == 0:
-            return None
+        self.counts[kv_type][group_name].update(codes)
 
-        frequencies = Counter(symbols)
+    def get_counts(self, kv_type, group_name):
+        return self.counts[kv_type][group_name]
+
+    def build_codebook(self, kv_type, group_name):
+
+        counts = self.counts[kv_type][group_name]
+
+        if len(counts) == 0:
+            return {}
+
+        # Only one symbol
+        if len(counts) == 1:
+            symbol = next(iter(counts))
+            return {
+                symbol: "0"
+            }
 
         heap = []
 
-        for symbol, frequency in frequencies.items():
-            node = HuffmanNode(
-                frequency=frequency,
-                symbol=symbol
-            )
-            heapq.heappush(heap, node)
+        counter = 0
 
-        # Only one unique symbol
-        if len(heap) == 1:
-            return heap[0]
+        for symbol, frequency in counts.items():
+
+            heapq.heappush(
+                heap,
+                (frequency, counter, symbol)
+            )
+
+            counter += 1
+
+        next_node = counter
+
+        # Tree:
+        # (left, right)
+        trees = {}
 
         while len(heap) > 1:
 
-            left = heapq.heappop(heap)
-            right = heapq.heappop(heap)
+            freq1, _, node1 = heapq.heappop(heap)
+            freq2, _, node2 = heapq.heappop(heap)
 
-            merged = HuffmanNode(
-                frequency=left.frequency + right.frequency,
-                left=left,
-                right=right
+            merged = next_node
+            next_node += 1
+
+            trees[merged] = (node1, node2)
+
+            heapq.heappush(
+                heap,
+                (
+                    freq1 + freq2,
+                    counter,
+                    merged
+                )
             )
 
-            heapq.heappush(heap, merged)
+            counter += 1
 
-        return heap[0]
+        root = heap[0][2]
 
-    # ============================================================
-    # GENERATE HUFFMAN CODES
-    # ============================================================
-
-    @staticmethod
-    def build_codes(root):
-        """
-        Generate:
-            symbol -> binary Huffman code
-        """
-
-        codes = {}
-
-        if root is None:
-            return codes
-
-        # Single-symbol case
-        if root.symbol is not None:
-            codes[root.symbol] = "0"
-            return codes
+        codebook = {}
 
         def traverse(node, code):
 
-            if node is None:
+            if node in counts:
+                codebook[node] = code
                 return
 
-            if node.symbol is not None:
-                codes[node.symbol] = code
-                return
+            left, right = trees[node]
 
-            traverse(
-                node.left,
-                code + "0"
-            )
-
-            traverse(
-                node.right,
-                code + "1"
-            )
+            traverse(left, code + "0")
+            traverse(right, code + "1")
 
         traverse(root, "")
 
-        return codes
+        return codebook
 
-    # ============================================================
-    # ENCODE
-    # ============================================================
+    def build_all_codebooks(self):
 
-    @classmethod
-    def encode(cls, symbols):
-        """
-        Huffman encode a list of integer symbols.
+        codebooks = {}
 
-        Returns:
-            encoded_data
-            codes
-            original_symbol_count
-        """
+        # Only these four groups use Huffman
+        huffman_groups = [
+            ("key", "inner"),
+            ("key", "outer_0"),
+            ("value", "inner"),
+            ("value", "outer_0"),
+        ]
 
-        if len(symbols) == 0:
-            return b"", {}, 0
+        for kv_type, group_name in huffman_groups:
 
-        root = cls.build_tree(symbols)
+            codebooks[f"{kv_type}_{group_name}"] = \
+                self.build_codebook(
+                    kv_type,
+                    group_name
+                )
 
-        codes = cls.build_codes(root)
+        return codebooks
 
-        # --------------------------------------------------------
-        # Convert Huffman bits into actual bytes
-        # --------------------------------------------------------
+    def print_summary(self):
 
-        output = bytearray()
+        print()
+        print("=" * 70)
+        print("HUFFMAN FREQUENCY SUMMARY")
+        print("=" * 70)
 
-        current_byte = 0
-        bit_count = 0
-        total_bits = 0
+        for kv_type in self.counts:
 
-        for symbol in symbols:
+            for group_name in self.counts[kv_type]:
 
-            code = codes[symbol]
+                counts = self.counts[kv_type][group_name]
 
-            for bit in code:
+                total = sum(counts.values())
 
-                current_byte <<= 1
+                print()
+                print(
+                    f"{kv_type.upper()} / {group_name}"
+                )
+                print(
+                    f"Total codes: {total:,}"
+                )
+                print(
+                    f"Unique codes: {len(counts)}"
+                )
 
-                if bit == "1":
-                    current_byte |= 1
+                if total > 0:
 
-                bit_count += 1
-                total_bits += 1
+                    for symbol, count in \
+                            counts.most_common():
 
-                if bit_count == 8:
+                        percentage = \
+                            100.0 * count / total
 
-                    output.append(current_byte)
-
-                    current_byte = 0
-                    bit_count = 0
-
-        # --------------------------------------------------------
-        # Handle final incomplete byte
-        # --------------------------------------------------------
-
-        padding_bits = 0
-
-        if bit_count > 0:
-
-            padding_bits = 8 - bit_count
-
-            current_byte <<= padding_bits
-
-            output.append(current_byte)
-
-        return (
-            bytes(output),
-            codes,
-            total_bits
-        )
-
-    # ============================================================
-    # DECODE
-    # ============================================================
-
-    @staticmethod
-    def decode(
-        encoded_data,
-        codes,
-        total_bits,
-        num_symbols
-    ):
-        """
-        Decode Huffman-compressed bytes.
-
-        Args:
-            encoded_data:
-                Compressed byte stream.
-
-            codes:
-                Dictionary:
-                    symbol -> Huffman code
-
-            total_bits:
-                Number of valid bits in encoded_data.
-
-            num_symbols:
-                Number of original symbols.
-
-        Returns:
-            List of decoded integer symbols.
-        """
-
-        if num_symbols == 0:
-            return []
-
-        if not codes:
-            return []
-
-        # Reverse dictionary:
-        # code -> symbol
-
-        reverse_codes = {
-            code: symbol
-            for symbol, code in codes.items()
-        }
-
-        decoded = []
-
-        current_code = ""
-
-        bits_read = 0
-
-        for byte in encoded_data:
-
-            for bit_position in range(7, -1, -1):
-
-                if bits_read >= total_bits:
-                    break
-
-                bit = (
-                    byte >> bit_position
-                ) & 1
-
-                current_code += str(bit)
-
-                bits_read += 1
-
-                if current_code in reverse_codes:
-
-                    decoded.append(
-                        reverse_codes[current_code]
-                    )
-
-                    current_code = ""
-
-                    if len(decoded) == num_symbols:
-                        return decoded
-
-        return decoded
-
-    # ============================================================
-    # COMPRESSION STATISTICS
-    # ============================================================
-
-    @staticmethod
-    def compression_stats(
-        original_bits,
-        compressed_bits
-    ):
-        """
-        Calculate compression ratio and memory reduction.
-        """
-
-        if original_bits <= 0:
-            return {
-                "compression_ratio": 0.0,
-                "memory_reduction": 0.0
-            }
-
-        if compressed_bits <= 0:
-            return {
-                "compression_ratio": 0.0,
-                "memory_reduction": 0.0
-            }
-
-        compression_ratio = (
-            original_bits / compressed_bits
-        )
-
-        memory_reduction = (
-            1.0
-            - compressed_bits / original_bits
-        ) * 100.0
-
-        return {
-            "compression_ratio": compression_ratio,
-            "memory_reduction": memory_reduction
-        }
-
-    # ============================================================
-    # COMPLETE COMPRESSION FUNCTION
-    # ============================================================
-
-    @classmethod
-    def compress(
-        cls,
-        symbols,
-        bits_per_symbol
-    ):
-        """
-        Complete Huffman compression.
-
-        Args:
-            symbols:
-                List of integer quantization indices.
-
-            bits_per_symbol:
-                Number of bits used by Oaken quantization
-                (8 or 9 in your implementation).
-
-        Returns:
-            dictionary containing compressed data,
-            Huffman codes and compression statistics.
-        """
-
-        encoded_data, codes, total_bits = cls.encode(
-            symbols
-        )
-
-        original_bits = (
-            len(symbols)
-            * bits_per_symbol
-        )
-
-        compressed_bits = total_bits
-
-        stats = cls.compression_stats(
-            original_bits,
-            compressed_bits
-        )
-
-        return {
-            "data": encoded_data,
-            "codes": codes,
-            "num_symbols": len(symbols),
-            "total_bits": total_bits,
-            "original_bits": original_bits,
-            "compressed_bits": compressed_bits,
-            "compression_ratio": stats[
-                "compression_ratio"
-            ],
-            "memory_reduction": stats[
-                "memory_reduction"
-            ]
-        }
-
-
-    @staticmethod
-    def measure_compression(symbols, bits_per_symbol):
-        """
-        Measure Huffman compression.
-        Does not modify the input.
-        """
-
-        if hasattr(symbols, "detach"):
-            symbols = (
-                symbols.detach()
-                .cpu()
-                .to(torch.int32)
-                .flatten()
-                .tolist()
-            )
-        else:
-            symbols = list(symbols)
-
-        if len(symbols) == 0:
-            return {
-                "original_bits": 0,
-                "compressed_bits": 0,
-                "compression_ratio": 0.0,
-                "memory_reduction": 0.0
-            }
-
-        result = HuffmanCodec.compress(
-            symbols=symbols,
-            bits_per_symbol=bits_per_symbol
-        )
-
-        return {
-            "original_bits": result["original_bits"],
-            "compressed_bits": result["compressed_bits"],
-            "compression_ratio": result["compression_ratio"],
-            "memory_reduction": result["memory_reduction"]
-        }
-
-    # ============================================================
-    # COMPLETE DECOMPRESSION FUNCTION
-    # ============================================================
-
-    @classmethod
-    def decompress(
-        cls,
-        compressed_data,
-        codes,
-        total_bits,
-        num_symbols
-    ):
-        """
-        Complete Huffman decompression.
-        """
-
-        return cls.decode(
-            encoded_data=compressed_data,
-            codes=codes,
-            total_bits=total_bits,
-            num_symbols=num_symbols
-        )
-
-
-# ================================================================
-# SIMPLE TEST
-# ================================================================
-
-if __name__ == "__main__":
-
-    test_symbols = [
-        3, 3, 3, 3,
-        2, 2, 2,
-        1, 1,
-        0
-    ]
-
-    print("Original symbols:")
-    print(test_symbols)
-
-    # ------------------------------------------------------------
-    # Compress
-    # ------------------------------------------------------------
-
-    result = HuffmanCodec.compress(
-        symbols=test_symbols,
-        bits_per_symbol=8
-    )
-
-    print("\nHuffman codes:")
-    print(result["codes"])
-
-    print("\nOriginal bits:")
-    print(result["original_bits"])
-
-    print("\nCompressed bits:")
-    print(result["compressed_bits"])
-
-    print("\nCompressed bytes:")
-    print(len(result["data"]))
-
-    print("\nCompression ratio:")
-    print(
-        f"{result['compression_ratio']:.3f}x"
-    )
-
-    print("\nMemory reduction:")
-    print(
-        f"{result['memory_reduction']:.2f}%"
-    )
-
-    # ------------------------------------------------------------
-    # Decompress
-    # ------------------------------------------------------------
-
-    decoded = HuffmanCodec.decompress(
-        compressed_data=result["data"],
-        codes=result["codes"],
-        total_bits=result["total_bits"],
-        num_symbols=result["num_symbols"]
-    )
-
-    print("\nDecoded symbols:")
-    print(decoded)
-
-    print("\nCorrect:")
-    print(
-        decoded == test_symbols
-    )
-
+                        print(
+                            f"  Code {symbol:2d}: "
+                            f"{count:10,} "
+                            f"({percentage:7.3f}%)"
+                        )
