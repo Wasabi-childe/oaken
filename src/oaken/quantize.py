@@ -173,6 +173,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             dequant, codes, qx, offset = cls.uniform_quantization_threshold_codes(
                 grouped_tensors[-1], cls.OUTLIER_BITS, minval_tensor, maxval_tensor
             )
+
+            if huffman_collector is not None:
+                huffman_collector.update(
+                    kv_type,
+                    "inner",
+                    codes,
+                    mask=masks[-1]
+                )
+            
             grouped_tensors[-1] = dequant
             codes_info["inner"] = {
                 "codes": codes.cpu(),
@@ -201,12 +210,13 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 dequant, codes, qx, offset, minval, maxval = cls.uniform_quantization_codes(combined, bits_used)
                 total_outlier = dequant
 
-                huffman_collector.update(
-                kv_type,
-                f"outer_{idx}",
-                codes,
-                mask=masks[idx]
-            )
+                if huffman_collector is not None:
+                    huffman_collector.update(
+                        kv_type,
+                        f"outer_{idx}",
+                        codes,
+                        mask=masks[idx]
+                    )
 
                 codes_info[f"outer_{idx}"] = {
                     "codes": codes.cpu(),
