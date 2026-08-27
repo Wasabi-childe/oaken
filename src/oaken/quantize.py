@@ -1,204 +1,246 @@
-from functools import partial
-import json
-from statistics import mean
-
+%%writefile /content/oaken/src/oaken/quantize.py
 import torch
-from src.oaken.quantize import *
-import pandas as pd
+from typing import Optional
 
-def multi_group_oaken_main(args, model, tokenizer, device, runner):
-    with open(args.quantizer_path, "r") as f:
-        quantizer_stat = json.load(f)
-        n_quant_group = quantizer_stat["n_quant_group"]
-        n_layer = len(model.get_decoder().layers)
-
-        sparsity_information = {
-            "key": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
-            "value": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
-            "counter": [0.0 for j in range(n_layer)]
-        }
-
-        # ---------------- NEW: accumulate every forward call's codes_info per layer (full KV cache, not just last token) ----------------
-        kv_capture = {
-            "key": [[] for _ in range(n_layer)],
-            "value": [[] for _ in range(n_layer)],
-        }
-
-        key_counter = 0
-        value_counter = 0
-
-        def tokenwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity, heatmap, codes_info = MultiThresholdTokenwiseQuantizer.downsample_with_codes(
-                output,
-                quantizer_stat["value"]["lower_threshold"][i],
-                quantizer_stat["value"]["upper_threshold"][i],
-                args.quant_outlier,
-                use_group_shift=True,
-            )
-            sparsity_information["value"][i] = [sum(x) for x in zip(sparsity_information["value"][i], sparsity)]
-            sparsity_information["counter"][i] += 0.5
-
-            # ---------------- NEW: append (not overwrite) so every token's codes for this layer are kept ----------------
-            kv_capture["value"][i].append(codes_info)
-
-            return tensor.half()
-
-        def channelwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity, heatmap, codes_info = MultiThresholdTokenwiseQuantizer.downsample_with_codes(
-                output,
-                quantizer_stat["key"]["lower_threshold"][i],
-                quantizer_stat["key"]["upper_threshold"][i],
-                args.quant_outlier,
-                use_group_shift=True,
-            )
-            sparsity_information["key"][i] = [sum(x) for x in zip(sparsity_information["key"][i], sparsity)]
-            sparsity_information["counter"][i] += 0.5
-
-            # ---------------- NEW: append (not overwrite) so every token's codes for this layer are kept ----------------
-            kv_capture["key"][i].append(codes_info)
-
-            return tensor.half()
+class OakenQuantizer:
+    QUANTIZE_BITS = 4
+    OUTLIER_BITS = 5
+    FLOAT_TOLERANCE = 1e-6
     
-        for i, decoder in enumerate(model.get_decoder().layers):
-            decoder.self_attn.v_proj.register_forward_hook(partial(tokenwise_quantize_activation_hook, i))
-            decoder.self_attn.k_proj.register_forward_hook(partial(channelwise_quantize_activation_hook, i))
-        
-        runner(args, model, tokenizer, device)
+    @classmethod
+    def get_outlier_threshold(cls, input_tensor: torch.Tensor, threshold_lower: float, threshold_upper: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        outlier_mask = torch.logical_or(input_tensor <= threshold_lower, threshold_upper <= input_tensor)
 
-        # ---------------- NEW: merge each layer's per-call codes_info entries into one combined tensor per group, ----------------
-        # ---------------- concatenated along the sequence/token dimension, then save the full KV cache to a .pt file ----------------
-        def merge_layer_codes(layer_calls):
-            """
-            layer_calls: list of codes_info dicts, one per forward call (one per token/chunk).
-            Returns: dict of {group_label: merged_codes_info} where each group's "codes"
-            (and "mask", if present) are concatenated along dim=-2 (the sequence dimension)
-            across all calls, preserving one entry per group across the whole sequence.
-            """
-            if len(layer_calls) == 0:
-                return {}
+        outlier = input_tensor * outlier_mask
+        inlier = input_tensor * ~outlier_mask
 
-            merged = {}
-            group_labels = layer_calls[0].keys()
-            for label in group_labels:
-                codes_list = [call[label]["codes"] for call in layer_calls]
-                merged_codes = torch.cat(codes_list, dim=-2)
+        return inlier, outlier, outlier_mask
 
-                entry = dict(layer_calls[0][label])  # copy static metadata (bits, qx, offset, etc.)
-                entry["codes"] = merged_codes
+    @classmethod
+    def get_multigroup_threshold(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        group_masks = list()
+        group_tensors = list()
+        prev_thr_low, prev_thr_up = None, None
+        for idx, (thr_low, thr_up) in enumerate(zip(threshold_lowers, threshold_uppers)):
+            if idx == len(threshold_lowers) - 1: 
+                # Inner-most Group
+                group_masks.append(mask := torch.logical_and(input_tensor > prev_thr_low, input_tensor < prev_thr_up))
+            elif (prev_thr_low is not None) and (prev_thr_up is not None):
+                group_masks.append(mask := torch.logical_or(
+                    torch.logical_and(prev_thr_low < input_tensor, input_tensor <= thr_low),
+                    torch.logical_and(thr_up <= input_tensor, input_tensor < prev_thr_up))
+                )
+            else:
+                # Outer-most Group
+                group_masks.append(mask := torch.logical_or(               input_tensor <= thr_low, thr_up <= input_tensor))
+            prev_thr_low = thr_low
+            prev_thr_up = thr_up
 
-                if "mask" in layer_calls[0][label]:
-                    mask_list = [call[label]["mask"] for call in layer_calls]
-                    entry["mask"] = torch.cat(mask_list, dim=-2)
-                if "higher_mask" in layer_calls[0][label]:
-                    entry["higher_mask"] = torch.cat([call[label]["higher_mask"] for call in layer_calls], dim=-2)
-                if "lower_mask" in layer_calls[0][label]:
-                    entry["lower_mask"] = torch.cat([call[label]["lower_mask"] for call in layer_calls], dim=-2)
+            group_tensors.append(input_tensor * mask)
 
-                merged[label] = entry
-            return merged
+        assert(len(threshold_lowers) == len(threshold_uppers) == len(group_tensors) == len(group_masks))
+        return group_tensors, group_masks
+    
+    @staticmethod
+    def uniform_quantization_threshold(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
+        rangeval = maxval - minval
+        qx = (2 ** bits - 1) / rangeval
+        offset = minval * qx
+        quantized = torch.round(qx * tensor - offset)
+        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
+        return (quantized + offset) / qx
 
-        full_kv_cache = {
-            "key": [merge_layer_codes(kv_capture["key"][i]) for i in range(n_layer)],
-            "value": [merge_layer_codes(kv_capture["value"][i]) for i in range(n_layer)],
+    @staticmethod
+    def uniform_quantization(tensor, bits: int):
+        maxval = torch.max(tensor).cpu().item()
+        minval = torch.min(tensor).cpu().item()
+        return OakenQuantizer.uniform_quantization_threshold(tensor, bits, minval, maxval)
+    
+    @classmethod
+    def downsample_mantissa(cls, tensor):
+        int16_tensor = tensor.view(torch.int16)
+        truncated = int16_tensor & 0b1_11111_1110_0000_00
+        return truncated.view(torch.float16)
+
+    # ---------------- NEW: same math as uniform_quantization_threshold, but also returns the raw integer codes ----------------
+    @staticmethod
+    def uniform_quantization_threshold_codes(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
+        rangeval = maxval - minval
+        qx = (2 ** bits - 1) / rangeval
+        offset = minval * qx
+        quantized = torch.round(qx * tensor - offset)
+        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
+        quantized = torch.clamp(quantized, 0, 2 ** bits - 1)  # ensures codes fit exactly in `bits` bits
+        dequantized = (quantized + offset) / qx
+        # codes are stored compactly: 4-bit values fit in uint8, 5-bit values fit in uint8 too
+        codes = quantized.to(torch.uint8)
+        return dequantized, codes, qx, offset
+
+    # ---------------- NEW: same as uniform_quantization, but also returns codes + qx/offset ----------------
+    @staticmethod
+    def uniform_quantization_codes(tensor, bits: int):
+        maxval = torch.max(tensor).cpu().item()
+        minval = torch.min(tensor).cpu().item()
+        dequantized, codes, qx, offset = OakenQuantizer.uniform_quantization_threshold_codes(tensor, bits, minval, maxval)
+        return dequantized, codes, qx, offset, minval, maxval
+
+
+class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+    @classmethod
+    def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
+                    quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
+        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
+        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+
+        if quantize_outlier:
+            # Quantize inner-most group
+            minval_tensor = torch.min(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
+            maxval_tensor = torch.max(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
+            grouped_tensors[-1] = cls.uniform_quantization_threshold(grouped_tensors[-1], cls.OUTLIER_BITS, minval_tensor, maxval_tensor)
+
+            # Quantize outer groups
+            for idx in range(len(threshold_lowers) - 1):
+                threshold_lower_tensor = torch.tensor(threshold_lowers[idx]).to(input_tensor.device).half()
+                threshold_upper_tensor = torch.tensor(threshold_uppers[idx]).to(input_tensor.device).half()
+
+                higher_mask = grouped_tensors[idx] > 0
+                lower_mask = grouped_tensors[idx] < 0
+                higher_outlier = grouped_tensors[idx] * higher_mask
+                lower_outlier = grouped_tensors[idx] * lower_mask
+
+                if use_group_shift:
+                    higher_outlier -= threshold_upper_tensor
+                    lower_outlier -= threshold_lower_tensor
+
+                if idx == len(threshold_lowers) - 2:
+                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.QUANTIZE_BITS)
+                else:
+                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.OUTLIER_BITS)
+
+                higher_outlier = total_outlier * higher_mask
+                lower_outlier = total_outlier * lower_mask
+                
+                if use_group_shift:
+                    higher_outlier += threshold_upper_tensor
+                    lower_outlier += threshold_lower_tensor
+
+                grouped_tensors[idx] = (higher_outlier * higher_mask) + (lower_outlier * lower_mask)
+        else:
+            # Quantize middle_group
+            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
+            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
+            grouped_tensors[-2] = cls.uniform_quantization_threshold(grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor)
+
+        # heat_map = torch.zeros_like(input_tensor)
+        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
+            result_tensor += tensor * mask
+            # heat_map += idx * mask
+        heat_map = None
+
+        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
+        return (result_tensor, val_frac, heat_map)
+
+    # ---------------- NEW: mirrors downsample(), but also returns the true integer codes ----------------
+    @classmethod
+    def downsample_with_codes(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
+                               quantize_outlier: bool = True, use_group_shift: bool = True):
+        """
+        Same behavior/output as downsample() for (result_tensor, val_frac, heat_map),
+        but additionally returns `codes_info`: a dict describing the actual integer
+        quantization codes for every group that got quantized, plus what's needed
+        to dequantize them back (qx, offset, bits, mask).
+
+        codes_info structure:
+        {
+            "<group_label>": {
+                "codes": torch.uint8 tensor (same shape as that group),
+                "bits": int,
+                "qx": tensor or float,
+                "offset": tensor or float,
+                "mask": bool tensor marking which elements belong to this group
+            },
+            ...
         }
+        """
+        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
+        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+        codes_info = {}
 
-        kv_save_path = getattr(args, "kv_capture_path", "quantized_kv.pt")
-        torch.save(full_kv_cache, kv_save_path)
-        print(f"Saved FULL quantized KV cache (all layers, all tokens) to {kv_save_path}")
-
-        key_sparsity = []
-        value_sparsity = []
-        key_sparsity_sum = [0.0 for _ in range(n_quant_group)]
-        value_sparsity_sum = [0.0 for _ in range(n_quant_group)]
-        for i in range(n_layer):
-            key_sparsity.append(
-                list(map(lambda x: x / sparsity_information['counter'][i], sparsity_information['key'][i]))
+        if quantize_outlier:
+            # Quantize inner-most group
+            minval_tensor = torch.min(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
+            maxval_tensor = torch.max(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
+            dequant, codes, qx, offset = cls.uniform_quantization_threshold_codes(
+                grouped_tensors[-1], cls.OUTLIER_BITS, minval_tensor, maxval_tensor
             )
-            value_sparsity.append(
-                list(map(lambda x: x / sparsity_information['counter'][i], sparsity_information['value'][i]))
+            grouped_tensors[-1] = dequant
+            codes_info["inner"] = {
+                "codes": codes.cpu(),
+                "bits": cls.OUTLIER_BITS,
+                "qx": qx.cpu() if torch.is_tensor(qx) else qx,
+                "offset": offset.cpu() if torch.is_tensor(offset) else offset,
+                "mask": masks[-1].cpu(),
+            }
+
+            # Quantize outer groups
+            for idx in range(len(threshold_lowers) - 1):
+                threshold_lower_tensor = torch.tensor(threshold_lowers[idx]).to(input_tensor.device).half()
+                threshold_upper_tensor = torch.tensor(threshold_uppers[idx]).to(input_tensor.device).half()
+
+                higher_mask = grouped_tensors[idx] > 0
+                lower_mask = grouped_tensors[idx] < 0
+                higher_outlier = grouped_tensors[idx] * higher_mask
+                lower_outlier = grouped_tensors[idx] * lower_mask
+
+                if use_group_shift:
+                    higher_outlier -= threshold_upper_tensor
+                    lower_outlier -= threshold_lower_tensor
+
+                bits_used = cls.QUANTIZE_BITS if idx == len(threshold_lowers) - 2 else cls.OUTLIER_BITS
+                combined = higher_outlier * higher_mask + lower_outlier * lower_mask
+                dequant, codes, qx, offset, minval, maxval = cls.uniform_quantization_codes(combined, bits_used)
+                total_outlier = dequant
+
+                codes_info[f"outer_{idx}"] = {
+                    "codes": codes.cpu(),
+                    "bits": bits_used,
+                    "qx": qx,
+                    "offset": offset,
+                    "mask": (higher_mask | lower_mask).cpu(),
+                    "use_group_shift": use_group_shift,
+                    "threshold_lower": threshold_lowers[idx],
+                    "threshold_upper": threshold_uppers[idx],
+                    "higher_mask": higher_mask.cpu(),
+                    "lower_mask": lower_mask.cpu(),
+                }
+
+                higher_outlier = total_outlier * higher_mask
+                lower_outlier = total_outlier * lower_mask
+                
+                if use_group_shift:
+                    higher_outlier += threshold_upper_tensor
+                    lower_outlier += threshold_lower_tensor
+
+                grouped_tensors[idx] = (higher_outlier * higher_mask) + (lower_outlier * lower_mask)
+        else:
+            # Quantize middle_group
+            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
+            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
+            dequant, codes, qx, offset = cls.uniform_quantization_threshold_codes(
+                grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor
             )
-            print(f"Decoder {i} Sparsity: Key - {key_sparsity[i]}, Value - {value_sparsity[i]}")
-            for idx, item in enumerate(key_sparsity[i]):
-                key_sparsity_sum[idx] += item
-            for idx, item in enumerate(value_sparsity[i]):
-                value_sparsity_sum[idx] += item
+            grouped_tensors[-2] = dequant
+            codes_info["middle"] = {
+                "codes": codes.cpu(),
+                "bits": cls.QUANTIZE_BITS,
+                "qx": qx.cpu() if torch.is_tensor(qx) else qx,
+                "offset": offset.cpu() if torch.is_tensor(offset) else offset,
+                "mask": masks[-2].cpu(),
+            }
 
-        print(f"Total Sparsity: Key - {[x / n_layer for x in key_sparsity_sum]}, Value - {[x / n_layer for x in value_sparsity_sum]}")
+        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
+            result_tensor += tensor * mask
+        heat_map = None
 
-def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner):
-    sparsity_information = {
-        "key": [0.0 for _ in range(len(model.get_decoder().layers))],
-        "value": [0.0 for _ in range(len(model.get_decoder().layers))],
-        "counter": [0.0 for _ in range(len(model.get_decoder().layers))]
-    }
-
-    # ---------------- NEW: accumulate every forward call's tensor per layer (full KV cache, not just last token) ----------------
-    n_layer = len(model.get_decoder().layers)
-    kv_capture = {
-        "key": [[] for _ in range(n_layer)],
-        "value": [[] for _ in range(n_layer)],
-    }
-
-    with open(args.quantizer_path, "r") as f:
-        quantizer_stat = json.load(f)
-        def tokenwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity = TokenwiseQuantizer.downsample(
-                output,
-                quantizer_stat["value"]["lower_threshold"][i],
-                quantizer_stat["value"]["upper_threshold"][i],
-                args.quant_outlier,
-            )
-            sparsity_information["value"][i] += sparsity
-            sparsity_information["counter"][i] += 0.5
-
-            # ---------------- NEW: append, not overwrite ----------------
-            # NOTE: TokenwiseQuantizer.downsample() doesn't return integer codes,
-            # so this still captures dequantized fp16 (see earlier note).
-            kv_capture["value"][i].append(tensor.detach().half().cpu())
-
-            return tensor.half()
-            
-        def channelwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity = ChannelwiseQuantizer.downsample(
-                output,
-                quantizer_stat["key"]["minval"][i],
-                quantizer_stat["key"]["maxval"][i],
-                quantizer_stat["key"]["lower_threshold"][i],
-                quantizer_stat["key"]["upper_threshold"][i],
-                args.quant_outlier,
-            )
-            sparsity_information["key"][i] += sparsity
-            sparsity_information["counter"][i] += 0.5
-
-            # ---------------- NEW: append, not overwrite ----------------
-            kv_capture["key"][i].append(tensor.detach().half().cpu())
-
-            return tensor.half()
-    
-    if args.model in ["opt", "llama"]:
-        for i, decoder in enumerate(model.get_decoder().layers):
-            decoder.self_attn.v_proj.register_forward_hook(partial(tokenwise_quantize_activation_hook, i))
-            decoder.self_attn.k_proj.register_forward_hook(partial(channelwise_quantize_activation_hook, i))
-    else:
-        raise ValueError(f"Model {args.model} not supported.")
-    
-    runner(args, model, tokenizer, device)
-
-    # ---------------- NEW: concatenate each layer's per-call tensors along the sequence dim, then save the full KV cache ----------------
-    full_kv_cache = {
-        "key": [torch.cat(kv_capture["key"][i], dim=-2) if len(kv_capture["key"][i]) > 0 else None for i in range(n_layer)],
-        "value": [torch.cat(kv_capture["value"][i], dim=-2) if len(kv_capture["value"][i]) > 0 else None for i in range(n_layer)],
-    }
-
-    kv_save_path = getattr(args, "kv_capture_path", "quantized_kv.pt")
-    torch.save(full_kv_cache, kv_save_path)
-    print(f"Saved FULL KV cache (all layers, all tokens) to {kv_save_path}")
-
-    key_sparsity = []
-    value_sparsity = []
-    for i in range(len(model.get_decoder().layers)):
-        key_sparsity.append(sparsity_information['key'][i] / sparsity_information['counter'][i])
-        value_sparsity.append(sparsity_information['value'][i] / sparsity_information['counter'][i])
-        print(f"Decoder {i} Sparsity: Key - {key_sparsity[i]}, Value - {value_sparsity[i]}")
-
-    print(f"Total Sparsity: Key - {mean(key_sparsity)}, Value - {mean(value_sparsity)}")
+        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
+        return (result_tensor, val_frac, heat_map, codes_info)
