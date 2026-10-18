@@ -95,9 +95,9 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
 
-    FP3E4M3Quantizer.load_codebook(
-        "quantizer/oaken/llama2-3.2-1b-v-codebook.json"
-    )    
+        FP3E4M3Quantizer.load_codebook(
+            "quantizer/oaken/llama2-3.2-1b-v-codebook.json"
+        )    
 
         def tokenwise_quantize_activation_hook(i, module, input, output):
             tensor, sparsity = TokenwiseQuantizer.downsample(
