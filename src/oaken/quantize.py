@@ -16,7 +16,7 @@ def _e2m1_round_magnitude(m):
 
 
 class FP4E4M3Quantizer:
-    BLOCK_SIZE = 16
+    BLOCK_SIZE = 32
 
     @classmethod
     def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
