@@ -14,6 +14,23 @@ def _e2m1_round_magnitude(m):
            + (m > 5.0).long())
     return levels[idx]
 
+class FP4Quantizer:
+    @classmethod
+    def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.numel() == 0:
+            return tensor.clone()
+
+        shape = tensor.shape
+        dtype = tensor.dtype
+
+        x = tensor.float()
+
+        # No scaling: quantize directly to the E2M1 FP4 codebook.
+        mag = _e2m1_round_magnitude(x.abs().clamp(max=6.0))
+        out = torch.copysign(mag, x)
+
+        return out.reshape(shape).to(dtype)
+
 
 class FP4E4M3Quantizer:
     BLOCK_SIZE = 32
