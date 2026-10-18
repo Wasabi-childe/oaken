@@ -32,7 +32,7 @@ class FP4Quantizer:
         return out.reshape(shape).to(dtype)
 
 class FP3E4M3Quantizer:
-    BLOCK_SIZE = 32
+    BLOCK_SIZE = 16
 
     @classmethod
     def quantize_dequantize(cls, tensor: torch.Tensor, block_size=None):
