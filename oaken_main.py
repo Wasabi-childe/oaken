@@ -20,12 +20,12 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         "counter": [0.0 for j in range(n_layer)]
     }
 
+    V_BLOCK_SIZE = 64  # Test 64 first, then 128
+    
     def tokenwise_quantize_activation_hook(i, module, input, output):
-        # V: plain FP4 + E4M3; no Oaken grouping.
-        tensor = FP4E4M3Quantizer.quantize_dequantize(output)
-
-        # No threshold-group sparsity is measured for V in this design.
-        # Keep the existing reporting structure.
+        tensor = FP4E4M3Quantizer.quantize_dequantize(
+            output, block_size=V_BLOCK_SIZE
+        )
         return tensor.half()
 
     def channelwise_quantize_activation_hook(i, module, input, output):
