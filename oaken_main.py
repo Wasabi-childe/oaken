@@ -22,11 +22,11 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
 
 
     def tokenwise_quantize_activation_hook(i, module, inputs, output):
-    quantized = FP3E4M3Quantizer.quantize_dequantize(
-        output,
-        block_size=32
-    )
-    return quantized.to(output.dtype)
+        quantized = FP3E4M3Quantizer.quantize_dequantize(
+            output,
+            block_size=32
+        )
+        return quantized.to(output.dtype)
 
     def channelwise_quantize_activation_hook(i, module, input, output):
         # K: retain Oaken thresholds, group shifting, and INT5 paths.
