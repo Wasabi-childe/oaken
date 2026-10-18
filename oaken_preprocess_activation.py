@@ -1,4 +1,4 @@
-```python
+
 import torch
 import argparse
 from functools import partial
@@ -205,4 +205,3 @@ if __name__ == "__main__":
         multi_key_value_tokenwise_main(args, eval_perplexity)
     else:
         multi_key_value_tokenwise_main(args, run_model)
-```
