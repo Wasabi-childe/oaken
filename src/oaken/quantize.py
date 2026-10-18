@@ -1,4 +1,4 @@
-import json
+
 import torch
 from typing import Optional
 
@@ -31,45 +31,13 @@ class FP4Quantizer:
 
         return out.reshape(shape).to(dtype)
 
-
 class FP3E4M3Quantizer:
-    BLOCK_SIZE = 16
-    CODEBOOK_PATH = (
-        "quantizer/oaken/llama2-3.2-1b-v-codebook.json"
-    )
-
-    _codebook = None
+    BLOCK_SIZE = 32
 
     @classmethod
-    def load_codebook(cls, path=None):
-        if path is None:
-            path = cls.CODEBOOK_PATH
-
-        with open(path, "r") as f:
-            data = json.load(f)
-
-        levels = data["levels"]
-
-        if len(levels) != 8:
-            raise ValueError(
-                "Expected 8 codebook levels, got {}".format(
-                    len(levels)
-                )
-            )
-
-        cls._codebook = torch.tensor(
-            levels, dtype=torch.float32
-        )
-
-        return cls._codebook
-
-    @classmethod
-    def quantize_dequantize(cls, tensor, block_size=None):
+    def quantize_dequantize(cls, tensor: torch.Tensor, block_size=None):
         if tensor.numel() == 0:
             return tensor.clone()
-
-        if cls._codebook is None:
-            cls.load_codebook()
 
         if block_size is None:
             block_size = cls.BLOCK_SIZE
@@ -86,41 +54,38 @@ class FP3E4M3Quantizer:
 
         blocks = x.reshape(n, -1, block_size)
 
-        # Same block scaling used during codebook calibration.
+        # One scale for each block.
         amax = blocks.abs().amax(dim=-1, keepdim=True)
-
         scale = (amax / 2.0).clamp(
             min=2.0**-9,
             max=448.0
         )
-
         scale = scale.to(torch.float8_e4m3fn).float()
 
+        # Normalize values to the FP3-like codebook.
         normalized = blocks / scale
+        magnitude = normalized.abs().clamp(max=2.0)
 
-        # The codebook contains eight signed reconstruction levels.
-        levels = cls._codebook.to(
-            device=normalized.device,
-            dtype=normalized.dtype
+        # Four magnitude levels: 0, 0.5, 1, 2.
+        idx = (
+            (magnitude >= 0.25).long()
+            + (magnitude >= 0.75).long()
+            + (magnitude >= 1.5).long()
         )
 
-        # Find the nearest codebook level for each value.
-        distances = torch.abs(
-            normalized.unsqueeze(-1)
-            - levels.view(1, 1, 1, 1, -1)
+        levels = torch.tensor(
+            [0.0, 0.5, 1.0, 2.0],
+            device=x.device,
+            dtype=x.dtype
         )
 
-        indices = distances.argmin(dim=-1)
-
-        quantized_normalized = levels[indices]
-
-        # Reconstruct the original-scale values.
-        quantized = quantized_normalized * scale
+        quantized_magnitude = levels[idx]
+        quantized = torch.copysign(
+            quantized_magnitude, normalized
+        ) * scale
 
         quantized = quantized.reshape(n, -1)[:, :w]
-
         return quantized.reshape(shape).to(dtype)
-
 
 
 class FP4E4M3Quantizer:
@@ -381,4 +346,3 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ]
 
         return result_tensor, val_frac, heat_map
-
