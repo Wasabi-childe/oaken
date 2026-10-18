@@ -33,7 +33,7 @@ class FP4Quantizer:
 
 
 class FP4E4M3Quantizer:
-    BLOCK_SIZE = 64
+    BLOCK_SIZE = 128
 
     @classmethod
     def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
