@@ -20,13 +20,13 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         "counter": [0.0 for j in range(n_layer)]
     }
 
-    def tokenwise_quantize_activation_hook(i, module, input, output):
-        # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
-        tensor = FP3E4M3Quantizer.quantize_dequantize(
-            output,
-            block_size=32
-        )
-        return tensor.half()
+
+    def tokenwise_quantize_activation_hook(i, module, inputs, output):
+    quantized = FP3E4M3Quantizer.quantize_dequantize(
+        output,
+        block_size=32
+    )
+    return quantized.to(output.dtype)
 
     def channelwise_quantize_activation_hook(i, module, input, output):
         # K: retain Oaken thresholds, group shifting, and INT5 paths.
@@ -94,6 +94,10 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
 
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
+
+    FP3E4M3Quantizer.load_codebook(
+    "quantizer/oaken/llama2-3.2-1b-v-codebook.json"
+)    
 
         def tokenwise_quantize_activation_hook(i, module, input, output):
             tensor, sparsity = TokenwiseQuantizer.downsample(
