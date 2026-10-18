@@ -3,74 +3,40 @@ import torch
 from typing import Optional
 
 
+import torch
+import torch.nn.functional as F
+
+def _e2m1_round_magnitude(m):
+    levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                          device=m.device, dtype=m.dtype)
+    idx = ((m > 0.25).long() + (m >= 0.75).long() + (m > 1.25).long()
+           + (m >= 1.75).long() + (m > 2.5).long() + (m >= 3.5).long()
+           + (m > 5.0).long())
+    return levels[idx]
+
+
 class FP4E4M3Quantizer:
     BLOCK_SIZE = 16
-    FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
     @classmethod
     def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
-        original_shape = tensor.shape
-        original_dtype = tensor.dtype
-
         if tensor.numel() == 0:
             return tensor.clone()
-
-        if tensor.dim() == 0:
-            tensor = tensor.reshape(1, 1)
-        elif tensor.dim() == 1:
-            tensor = tensor.reshape(1, -1)
-        else:
-            tensor = tensor.reshape(-1, tensor.shape[-1])
-
-        result = torch.zeros_like(tensor)
-        levels = torch.tensor(
-            cls.FP4_LEVELS,
-            device=tensor.device,
-            dtype=torch.float32
-        )
-
-        # Quantize each row in blocks of 16 values.
-        for row_idx in range(tensor.shape[0]):
-            for start in range(0, tensor.shape[1], cls.BLOCK_SIZE):
-                end = min(start + cls.BLOCK_SIZE, tensor.shape[1])
-
-                block = tensor[row_idx, start:end].float()
-                max_abs = torch.max(torch.abs(block))
-
-                if max_abs == 0:
-                    continue
-
-                # E4M3 block scale: maximum FP4 magnitude is 6.
-                scale = max_abs / 6.0
-
-                # Round the scale to a finite E4M3 value.
-                scale = torch.clamp(scale, min=2.0 ** -9, max=448.0)
-                scale = scale.to(torch.float8_e4m3fn).float()
-
-                # Guard against a scale that rounds to zero.
-                if scale == 0:
-                    scale = torch.tensor(
-                        2.0 ** -9,
-                        device=tensor.device,
-                        dtype=torch.float32
-                    )
-
-                normalized = torch.abs(block) / scale
-
-                # Map each value to its nearest E2M1 level.
-                distances = torch.abs(
-                    normalized.unsqueeze(-1) - levels
-                )
-                nearest_idx = torch.argmin(distances, dim=-1)
-                quantized = levels[nearest_idx] * scale
-
-                # Restore the sign.
-                quantized = torch.sign(block) * quantized
-
-                result[row_idx, start:end] = quantized
-
-        return result.reshape(original_shape).to(original_dtype)
-
+        shape, dtype = tensor.shape, tensor.dtype
+        x = tensor.reshape(-1, shape[-1]).float()
+        n, w = x.shape
+        pad = (-w) % cls.BLOCK_SIZE
+        if pad:
+            x = F.pad(x, (0, pad))                       # zeros do not change block amax
+        blocks = x.reshape(n, -1, cls.BLOCK_SIZE)
+        amax = blocks.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / 6.0).clamp(min=2.0 ** -9, max=448.0)
+        scale = scale.to(torch.float8_e4m3fn).float()
+        normalized = blocks / scale
+        mag = _e2m1_round_magnitude(normalized.abs().clamp(max=6.0))
+        out = torch.copysign(mag, normalized) * scale     # all-zero blocks stay exactly zero
+        out = out.reshape(n, -1)[:, :w]
+        return out.reshape(shape).to(dtype)
 
 class OakenQuantizer:
     QUANTIZE_BITS = 4
