@@ -24,7 +24,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
         tensor = FP4E4M3Quantizer.quantize_dequantize(
             output,
-            block_size=32
+            block_size=64
         )
         return tensor.half()
 
