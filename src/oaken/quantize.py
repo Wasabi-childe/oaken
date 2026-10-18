@@ -160,6 +160,7 @@ class OakenQuantizer:
         return truncated.view(torch.float16)
 
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
     @classmethod
@@ -183,61 +184,54 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ).half()
 
         if quantize_outlier:
-            # Quantize inner-most group using the original INT5 path.
-            minval_tensor = torch.min(
-                grouped_tensors[-1], dim=-1
-            ).values.unsqueeze(-1)
 
-            maxval_tensor = torch.max(
-                grouped_tensors[-1], dim=-1
-            ).values.unsqueeze(-1)
-
-            grouped_tensors[-1] = cls.uniform_quantization_threshold(
-                grouped_tensors[-1],
-                cls.OUTLIER_BITS,
-                minval_tensor,
-                maxval_tensor
+            # Quantize the inner-most group using FP4 + E4M3.
+            grouped_tensors[-1] = (
+                FP4E4M3Quantizer.quantize_dequantize(
+                    grouped_tensors[-1]
+                )
             )
 
-            # Quantize outer groups.
+            # Quantize the outer groups using FP4 + E4M3.
             for idx in range(len(threshold_lowers) - 1):
+
                 threshold_lower_tensor = torch.tensor(
-                    threshold_lowers[idx]
-                ).to(input_tensor.device).half()
+                    threshold_lowers[idx],
+                    device=input_tensor.device
+                ).half()
 
                 threshold_upper_tensor = torch.tensor(
-                    threshold_uppers[idx]
-                ).to(input_tensor.device).half()
+                    threshold_uppers[idx],
+                    device=input_tensor.device
+                ).half()
 
                 higher_mask = grouped_tensors[idx] > 0
                 lower_mask = grouped_tensors[idx] < 0
 
-                higher_outlier = grouped_tensors[idx] * higher_mask
-                lower_outlier = grouped_tensors[idx] * lower_mask
+                higher_outlier = (
+                    grouped_tensors[idx] * higher_mask
+                )
+                lower_outlier = (
+                    grouped_tensors[idx] * lower_mask
+                )
 
+                # Preserve the original group-shifting behavior.
                 if use_group_shift:
                     higher_outlier -= threshold_upper_tensor
                     lower_outlier -= threshold_lower_tensor
 
-                if idx == len(threshold_lowers) - 2:
-                    # REPLACED: INT4 -> FP4 + E4M3
-                    total_outlier = (
-                        FP4E4M3Quantizer.quantize_dequantize(
-                            higher_outlier * higher_mask
-                            + lower_outlier * lower_mask
-                        )
-                    )
-                else:
-                    # Keep the original INT5 path unchanged.
-                    total_outlier = cls.uniform_quantization(
+                # FP4 + E4M3 replaces INT5 for all outlier groups.
+                total_outlier = (
+                    FP4E4M3Quantizer.quantize_dequantize(
                         higher_outlier * higher_mask
-                        + lower_outlier * lower_mask,
-                        cls.OUTLIER_BITS
+                        + lower_outlier * lower_mask
                     )
+                )
 
                 higher_outlier = total_outlier * higher_mask
                 lower_outlier = total_outlier * lower_mask
 
+                # Restore the original threshold offsets.
                 if use_group_shift:
                     higher_outlier += threshold_upper_tensor
                     lower_outlier += threshold_lower_tensor
@@ -248,8 +242,8 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
 
         else:
-            # Quantize middle group.
-            # REPLACED: INT4 -> FP4 + E4M3
+
+            # Quantize the middle group using FP4 + E4M3.
             grouped_tensors[-2] = (
                 FP4E4M3Quantizer.quantize_dequantize(
                     grouped_tensors[-2]
@@ -257,16 +251,17 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             )
 
         # Reconstruct the result using the original group masks.
-        for idx, (tensor, mask) in enumerate(
-            zip(grouped_tensors, masks)
-        ):
+        for tensor, mask in zip(grouped_tensors, masks):
             result_tensor += tensor * mask
 
         heat_map = None
 
         val_frac = [
-            (torch.count_nonzero(mask) / torch.numel(mask)).item()
+            (
+                torch.count_nonzero(mask) / torch.numel(mask)
+            ).item()
             for mask in masks
         ]
 
         return result_tensor, val_frac, heat_map
+
