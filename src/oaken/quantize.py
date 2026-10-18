@@ -68,7 +68,7 @@ class FP3E4M3Quantizer:
 
         # Four magnitude levels: 0, 0.5, 1, 2.
         idx = (
-            (magnitude > 0.25).long()
+            (magnitude >= 0.25).long()
             + (magnitude >= 0.75).long()
             + (magnitude >= 1.5).long()
         )
