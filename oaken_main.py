@@ -20,11 +20,11 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         "counter": [0.0 for j in range(n_layer)]
     }
 
-    V_BLOCK_SIZE = 64  # Test 64 first, then 128
-    
     def tokenwise_quantize_activation_hook(i, module, input, output):
-        tensor = FP4E4M3Quantizer.quantize_dequantize(
-            output, block_size=V_BLOCK_SIZE
+        # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
+        tensor = FP3E4M3Quantizer.quantize_dequantize(
+            output,
+            block_size=32
         )
         return tensor.half()
 
