@@ -31,62 +31,6 @@ class FP4Quantizer:
 
         return out.reshape(shape).to(dtype)
 
-class FP3E4M3Quantizer:
-    BLOCK_SIZE = 32
-
-    @classmethod
-    def quantize_dequantize(cls, tensor: torch.Tensor, block_size=None):
-        if tensor.numel() == 0:
-            return tensor.clone()
-
-        if block_size is None:
-            block_size = cls.BLOCK_SIZE
-
-        shape = tensor.shape
-        dtype = tensor.dtype
-
-        x = tensor.reshape(-1, shape[-1]).float()
-        n, w = x.shape
-
-        pad = (-w) % block_size
-        if pad:
-            x = F.pad(x, (0, pad))
-
-        blocks = x.reshape(n, -1, block_size)
-
-        # One scale for each block.
-        amax = blocks.abs().amax(dim=-1, keepdim=True)
-        scale = (amax / 2.0).clamp(
-            min=2.0**-9,
-            max=448.0
-        )
-        scale = scale.to(torch.float8_e4m3fn).float()
-
-        # Normalize values to the FP3-like codebook.
-        normalized = blocks / scale
-        magnitude = normalized.abs().clamp(max=2.0)
-
-        # Four magnitude levels: 0, 0.5, 1, 2.
-        idx = (
-            (magnitude >= 0.25).long()
-            + (magnitude >= 0.75).long()
-            + (magnitude >= 1.5).long()
-        )
-
-        levels = torch.tensor(
-            [0.0, 0.5, 1.0, 2.0],
-            device=x.device,
-            dtype=x.dtype
-        )
-
-        quantized_magnitude = levels[idx]
-        quantized = torch.copysign(
-            quantized_magnitude, normalized
-        ) * scale
-
-        quantized = quantized.reshape(n, -1)[:, :w]
-        return quantized.reshape(shape).to(dtype)
-
 
 class FP4E4M3Quantizer:
     BLOCK_SIZE = 32
