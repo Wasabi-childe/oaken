@@ -36,22 +36,31 @@ class FP4E4M3Quantizer:
     BLOCK_SIZE = 32
 
     @classmethod
-    def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
+    def quantize_dequantize(cls, tensor, block_size=None):
         if tensor.numel() == 0:
             return tensor.clone()
+
+        if block_size is None:
+            block_size = cls.BLOCK_SIZE
+
         shape, dtype = tensor.shape, tensor.dtype
         x = tensor.reshape(-1, shape[-1]).float()
         n, w = x.shape
-        pad = (-w) % cls.BLOCK_SIZE
+
+        pad = (-w) % block_size
         if pad:
-            x = F.pad(x, (0, pad))                       # zeros do not change block amax
-        blocks = x.reshape(n, -1, cls.BLOCK_SIZE)
+            x = F.pad(x, (0, pad))
+
+        blocks = x.reshape(n, -1, block_size)
         amax = blocks.abs().amax(dim=-1, keepdim=True)
-        scale = (amax / 6.0).clamp(min=2.0 ** -9, max=448.0)
+
+        scale = (amax / 6.0).clamp(min=2.0**-9, max=448.0)
         scale = scale.to(torch.float8_e4m3fn).float()
+
         normalized = blocks / scale
         mag = _e2m1_round_magnitude(normalized.abs().clamp(max=6.0))
-        out = torch.copysign(mag, normalized) * scale     # all-zero blocks stay exactly zero
+        out = torch.copysign(mag, normalized) * scale
+
         out = out.reshape(n, -1)[:, :w]
         return out.reshape(shape).to(dtype)
 
