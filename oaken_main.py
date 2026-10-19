@@ -21,10 +21,11 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     }
 
     def tokenwise_quantize_activation_hook(i, module, input, output):
-        # V: direct token-wise FP4 + E4M3 scale.
-        # No Oaken thresholds, outlier handling, or group shifting.
-        tensor = MultiThresholdTokenwiseQuantizer.downsample_value(output)
-        return tensor.to(output.dtype)
+        # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
+        tensor = FP4E4M3Quantizer.quantize_dequantize(
+            output
+        )
+        return tensor.half()
 
     def channelwise_quantize_activation_hook(i, module, input, output):
         # K: retain Oaken thresholds, group shifting, and INT5 paths.
@@ -93,9 +94,16 @@ def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner)
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
 
-    def tokenwise_quantize_activation_hook(i, module, input, output):
-        tensor = MultiThresholdTokenwiseQuantizer.downsample_value(output)
-        return tensor.to(output.dtype)
+        def tokenwise_quantize_activation_hook(i, module, input, output):
+            tensor, sparsity = TokenwiseQuantizer.downsample(
+                output,
+                quantizer_stat["value"]["lower_threshold"][i],
+                quantizer_stat["value"]["upper_threshold"][i],
+                args.quant_outlier,
+            )
+            sparsity_information["value"][i] += sparsity
+            sparsity_information["counter"][i] += 0.5
+            return tensor.half()
 
         def channelwise_quantize_activation_hook(i, module, input, output):
             tensor, sparsity = ChannelwiseQuantizer.downsample(
