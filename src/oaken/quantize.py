@@ -227,7 +227,9 @@ class OakenQuantizer:
 
 
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
     @classmethod
     def downsample(
         cls,
@@ -237,6 +239,11 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         quantize_outlier: bool = True,
         use_group_shift: bool = True
     ):
+        """
+        Key path:
+        Oaken threshold grouping + optional group shifting + FP4 quantization.
+        """
+
         grouped_tensors, masks = cls.get_multigroup_threshold(
             input_tensor,
             threshold_lowers,
@@ -252,13 +259,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 scale_mode="token"
             )
 
-            # Quantize every outer group to FP4.
+            # Quantize all outer groups to FP4.
             for idx in range(len(threshold_lowers) - 1):
+
                 low = torch.as_tensor(
                     threshold_lowers[idx],
                     device=input_tensor.device,
                     dtype=input_tensor.dtype
                 )
+
                 high = torch.as_tensor(
                     threshold_uppers[idx],
                     device=input_tensor.device,
@@ -266,6 +275,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
 
                 group = grouped_tensors[idx]
+
                 positive_mask = group > 0
                 negative_mask = group < 0
 
@@ -299,12 +309,13 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
 
         else:
-            # Only the middle group is quantized to FP4.
+            # Preserve the existing middle-group-only behavior.
             grouped_tensors[-2] = FP4E4M3Quantizer.quantize_dequantize(
                 grouped_tensors[-2],
                 scale_mode="token"
             )
 
+        # Reconstruct the grouped tensor.
         for group, mask in zip(grouped_tensors, masks):
             result_tensor += (group * mask).to(result_tensor.dtype)
 
@@ -314,3 +325,18 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ]
 
         return result_tensor, val_frac, None
+
+    @classmethod
+    def downsample_value(cls, input_tensor: torch.Tensor):
+        """
+        Value path:
+        Direct token-wise FP4 quantization.
+        No Oaken thresholds, outlier masks, or group shifting.
+        """
+
+        quantized = FP4E4M3Quantizer.quantize_dequantize(
+            input_tensor,
+            scale_mode="token"
+        )
+
+        return quantized.to(input_tensor.dtype)
