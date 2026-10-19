@@ -381,7 +381,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 total_outlier = (
                     FP4E4M3Quantizer.quantize_dequantize(
                         higher_outlier * higher_mask
-                        + lower_outlier * lower_mask, scale_mode="group", group_size=32
+                        + lower_outlier * lower_mask, scale_mode="group", group_size=16
                     )
                 )
 
@@ -403,7 +403,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             # Quantize the middle group using FP4 + E4M3.
             grouped_tensors[-2] = (
                 FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-2], scale_mode="group", group_size=32
+                    grouped_tensors[-2], scale_mode="group", group_size=16
                 )
             )
 
