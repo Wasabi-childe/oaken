@@ -32,37 +32,51 @@ class FP4Quantizer:
         return out.reshape(shape).to(dtype)
 
 
-class FP4E4M3Quantizer:
-    BLOCK_SIZE = 32
 
+class FP4E4M3Quantizer:
     @classmethod
-    def quantize_dequantize(cls, tensor, block_size=None):
+    def quantize_dequantize(cls, tensor):
         if tensor.numel() == 0:
             return tensor.clone()
 
-        if block_size is None:
-            block_size = cls.BLOCK_SIZE
+        shape = tensor.shape
+        dtype = tensor.dtype
+        x = tensor.float()
 
-        shape, dtype = tensor.shape, tensor.dtype
-        x = tensor.reshape(-1, shape[-1]).float()
-        n, w = x.shape
+        # One scale across the entire last dimension.
+        amax = x.abs().amax(dim=-1, keepdim=True)
 
-        pad = (-w) % block_size
-        if pad:
-            x = F.pad(x, (0, pad))
+        # FP4 E2M1 maximum magnitude is 6.
+        scale = amax / 6.0
 
-        blocks = x.reshape(n, -1, block_size)
-        amax = blocks.abs().amax(dim=-1, keepdim=True)
+        # Avoid a zero scale for all-zero groups.
+        scale = torch.where(
+            amax == 0,
+            torch.ones_like(scale),
+            scale
+        )
 
-        scale = (amax / 6.0).clamp(min=2.0**-9, max=448.0)
+        # Store scale in E4M3 format, then convert back
+        # to float for quantization arithmetic.
         scale = scale.to(torch.float8_e4m3fn).float()
 
-        normalized = blocks / scale
-        mag = _e2m1_round_magnitude(normalized.abs().clamp(max=6.0))
+        # Prevent division by zero if scale underflows.
+        scale = torch.where(
+            scale == 0,
+            torch.ones_like(scale),
+            scale
+        )
+
+        normalized = x / scale
+
+        mag = _e2m1_round_magnitude(
+            normalized.abs().clamp(max=6.0)
+        )
+
         out = torch.copysign(mag, normalized) * scale
 
-        out = out.reshape(n, -1)[:, :w]
         return out.reshape(shape).to(dtype)
+
 
 class OakenQuantizer:
     QUANTIZE_BITS = 4
