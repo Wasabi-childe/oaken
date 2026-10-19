@@ -30,19 +30,34 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
 
 
 
+
     def channelwise_quantize_activation_hook(i, module, input, output):
-        # K: Hadamard rotation -> plain FP4 + E4M3 quantization
-        # -> inverse Hadamard rotation.
-        rotated = hadamard_transform(output.float())
+        # Expected projection output: [batch, sequence, hidden_size]
+        batch_size, seq_len, hidden_size = output.shape
     
-        tensor = FP4E4M3Quantizer.quantize_dequantize(
-            rotated,
-            block_size=64
+        num_heads = model.config.num_attention_heads
+        head_dim = hidden_size // num_heads
+    
+        # Split hidden features into attention heads.
+        x = output.reshape(
+            batch_size, seq_len, num_heads, head_dim
+        ).float()
+    
+        # Rotate each head independently along its head dimension.
+        x = hadamard_transform(x)
+    
+        # Plain FP4 + E4M3 quantization; no Oaken outlier handling.
+        x = FP4E4M3Quantizer.quantize_dequantize(
+            x,
+            block_size=32
         )
     
-        tensor = hadamard_transform(tensor)
+        # Inverse rotation.
+        x = hadamard_transform(x)
     
-        return tensor.half()
+        # Restore the original projection-output shape.
+        return x.reshape(batch_size, seq_len, hidden_size).half()
+
 
 
 
