@@ -41,30 +41,11 @@ def multi_key_value_tokenwise_main(args, runner):
             "lower_threshold": [0.0 for _ in range(n_quant_group)],
             "counter": 0,
         } for _ in range(n_layer)],
-        "value": [{
-            "upper_threshold": [0.0 for _ in range(n_quant_group)],
-            "lower_threshold": [0.0 for _ in range(n_quant_group)],
-            "counter": 0,
-        } for _ in range(n_layer)],
     }
 
     sample_rate = args.sample_rate
 
-    def get_value_activation_stat_hook(i, module, input, output):
-        if sample_rate != 1.0:
-            sampled_indices = torch.randperm(output.size(1))[:int(sample_rate * output.size(1))]
-            output_float32 = output[:,sampled_indices,:].float()
-        else:
-            output_float32 = output.float()
-        accumulated_frac = 0.0
-        for idx, frac in enumerate(args.list_fracs):
-            accumulated_frac += frac
-            stat["value"][i]["upper_threshold"][idx] += \
-                torch.quantile(output_float32, 1 - accumulated_frac / 2.0, dim=None, interpolation="higher").half().cpu().item()
-            stat["value"][i]["lower_threshold"][idx] += \
-                torch.quantile(output_float32, accumulated_frac / 2.0, dim=None, interpolation="lower").half().cpu().item()
-        stat["value"][i]["counter"] += 1
-        return output
+
         
     def get_key_activation_stat_hook(i, module, input, output):
         # return output
@@ -86,7 +67,6 @@ def multi_key_value_tokenwise_main(args, runner):
     # Register forward hooks to KV results
     for i, decoder in enumerate(model.get_decoder().layers):
         decoder.self_attn.k_proj.register_forward_hook(partial(get_key_activation_stat_hook, i))
-        decoder.self_attn.v_proj.register_forward_hook(partial(get_value_activation_stat_hook, i))
     
     # Run inference
     runner(args, model, tokenizer, torch_device)
