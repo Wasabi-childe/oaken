@@ -33,49 +33,166 @@ class FP4Quantizer:
 
 
 
+
 class FP4E4M3Quantizer:
-    @classmethod
-    def quantize_dequantize(cls, tensor):
+
+    @staticmethod
+    def quantize_dequantize(
+        tensor,
+        scale_mode="token",
+        group_size=32
+    ):
+        """
+        FP4 E2M1 quantization with E4M3 scales.
+
+        Parameters
+        ----------
+        tensor:
+            Input tensor. The last dimension is the feature dimension.
+
+        scale_mode:
+            "token": one scale for the complete last dimension
+                     of each token.
+
+            "group": one scale per group along the last dimension.
+
+        group_size:
+            Number of values covered by each scale in group mode.
+            Ignored in token mode.
+
+        Returns
+        -------
+        Dequantized tensor in the original shape and dtype.
+        """
+
+        if scale_mode not in ("token", "group"):
+            raise ValueError(
+                "scale_mode must be 'token' or 'group'"
+            )
+
         if tensor.numel() == 0:
             return tensor.clone()
 
-        shape = tensor.shape
-        dtype = tensor.dtype
+        if scale_mode == "group" and group_size <= 0:
+            raise ValueError(
+                "group_size must be greater than zero"
+            )
+
+        original_shape = tensor.shape
+        original_dtype = tensor.dtype
+        last_dim = original_shape[-1]
+
+        # Work in FP32 for the quantization calculations.
         x = tensor.float()
 
-        # One scale across the entire last dimension.
-        amax = x.abs().amax(dim=-1, keepdim=True)
+        # Flatten all leading dimensions into rows.
+        # For [batch, sequence, hidden], each row represents a token.
+        x = x.reshape(-1, last_dim)
 
-        # FP4 E2M1 maximum magnitude is 6.
-        scale = amax / 6.0
+        if scale_mode == "token":
 
-        # Avoid a zero scale for all-zero groups.
-        scale = torch.where(
-            amax == 0,
-            torch.ones_like(scale),
-            scale
-        )
+            # One scale for the entire feature vector of each token.
+            amax = x.abs().amax(
+                dim=-1,
+                keepdim=True
+            )
 
-        # Store scale in E4M3 format, then convert back
-        # to float for quantization arithmetic.
-        scale = scale.to(torch.float8_e4m3fn).float()
+            scale = amax / 6.0
 
-        # Prevent division by zero if scale underflows.
-        scale = torch.where(
-            scale == 0,
-            torch.ones_like(scale),
-            scale
-        )
+            # Handle all-zero vectors safely.
+            scale = torch.where(
+                amax > 0,
+                scale,
+                torch.ones_like(scale)
+            )
 
-        normalized = x / scale
+            # Store scales in E4M3, then use their represented values.
+            scale = scale.to(
+                torch.float8_e4m3fn
+            ).float()
 
-        mag = _e2m1_round_magnitude(
-            normalized.abs().clamp(max=6.0)
-        )
+            scale = scale.clamp_min(1e-8)
 
-        out = torch.copysign(mag, normalized) * scale
+            normalized = x / scale
 
-        return out.reshape(shape).to(dtype)
+            normalized = normalized.clamp(-6.0, 6.0)
+
+            magnitude = _e2m1_round_magnitude(
+                normalized.abs()
+            )
+
+            quantized = normalized.sign() * magnitude
+
+            reconstructed = quantized * scale
+
+        else:
+
+            # Pad the feature dimension to complete the last group.
+            padding = (
+                group_size - last_dim % group_size
+            ) % group_size
+
+            if padding:
+                x = torch.nn.functional.pad(
+                    x,
+                    (0, padding)
+                )
+
+            padded_dim = x.shape[-1]
+            n_groups = padded_dim // group_size
+
+            # [rows, groups, values_per_group]
+            grouped = x.reshape(
+                x.shape[0],
+                n_groups,
+                group_size
+            )
+
+            # One scale per group.
+            amax = grouped.abs().amax(
+                dim=-1,
+                keepdim=True
+            )
+
+            scale = amax / 6.0
+
+            scale = torch.where(
+                amax > 0,
+                scale,
+                torch.ones_like(scale)
+            )
+
+            scale = scale.to(
+                torch.float8_e4m3fn
+            ).float()
+
+            scale = scale.clamp_min(1e-8)
+
+            normalized = grouped / scale
+
+            normalized = normalized.clamp(-6.0, 6.0)
+
+            magnitude = _e2m1_round_magnitude(
+                normalized.abs()
+            )
+
+            quantized = normalized.sign() * magnitude
+
+            reconstructed = quantized * scale
+
+            # Restore the padded groups to a flat feature dimension.
+            reconstructed = reconstructed.reshape(
+                x.shape[0],
+                padded_dim
+            )
+
+            # Remove padding.
+            reconstructed = reconstructed[:, :last_dim]
+
+        return reconstructed.reshape(
+            original_shape
+        ).to(original_dtype)
+
 
 
 class OakenQuantizer:
