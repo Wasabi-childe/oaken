@@ -7,105 +7,6 @@ from src.oaken.quantize import *
 import pandas as pd
 
 
-
-from functools import partial
-import torch
-
-
-def calibrate_k_channel_masks(args, model, tokenizer, device):
-    import torch
-    from datasets import load_dataset
-
-    calibration = load_dataset(
-        "wikitext",
-        "wikitext-2-raw-v1",
-        split="train"
-    )
-
-    encodings = tokenizer(
-        "\n\n".join(calibration["text"]),
-        return_tensors="pt"
-    )
-
-    max_length = 2048
-    seq_len = encodings.input_ids.size(1)
-    n_layer = len(model.get_decoder().layers)
-
-    score_sums = [None for _ in range(n_layer)]
-    score_counts = [0 for _ in range(n_layer)]
-    handles = []
-
-    def make_hook(layer_idx):
-        def hook(module, inputs, output):
-            x = output.detach().float()
-            reduce_dims = tuple(range(x.ndim - 1))
-            channel_sum = x.abs().sum(dim=reduce_dims)
-            count = x.numel() // x.shape[-1]
-
-            if score_sums[layer_idx] is None:
-                score_sums[layer_idx] = channel_sum
-            else:
-                score_sums[layer_idx] += channel_sum
-
-            score_counts[layer_idx] += count
-            return output
-
-        return hook
-
-    for i, layer in enumerate(model.get_decoder().layers):
-        handles.append(
-            layer.self_attn.k_proj.register_forward_hook(
-                make_hook(i)
-            )
-        )
-
-    try:
-        model.eval()
-
-        with torch.no_grad():
-            for start in range(0, seq_len, max_length):
-                input_ids = encodings.input_ids[
-                    :, start:start + max_length
-                ].to(device)
-
-                if input_ids.shape[1] == 0:
-                    continue
-
-                model(input_ids)
-
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    channel_masks = []
-
-    for i in range(n_layer):
-        if score_sums[i] is None or score_counts[i] == 0:
-            raise RuntimeError(
-                "No calibration data collected for layer " + str(i)
-            )
-
-        scores = score_sums[i] / score_counts[i]
-        n_channels = scores.numel()
-        n_fp4 = max(1, int(n_channels * 0.25 + 0.5))
-
-        selected = torch.topk(scores, k=n_fp4).indices
-
-        mask = torch.zeros(
-            n_channels, dtype=torch.bool, device=scores.device
-        )
-        mask[selected] = True
-        channel_masks.append(mask)
-
-        print(
-            "Calibration layer", i,
-            "| FP4 channels:", int(mask.sum().item()),
-            "| FP2 channels:", int((~mask).sum().item())
-        )
-
-    return channel_masks
-
-
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
@@ -113,59 +14,76 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     n_quant_group = quantizer_stat["n_quant_group"]
     n_layer = len(model.get_decoder().layers)
 
-    # Phase 1: Calibrate K-channel masks using WikiText-2 train.
-    channel_masks = calibrate_k_channel_masks(
-        args, model, tokenizer, device
+    sparsity_information = {
+        "key": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
+        "value": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
+        "counter": [0.0 for j in range(n_layer)]
+    }
+
+    def tokenwise_quantize_activation_hook(i, module, input, output):
+        # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
+        tensor = FP4E4M3Quantizer.quantize_dequantize(
+            output,
+            block_size=64
+        )
+        return tensor.half()
+
+    def channelwise_quantize_activation_hook(i, module, input, output):
+        # K: retain Oaken thresholds, group shifting, and INT5 paths.
+        # The INT4 path inside downsample() is replaced by FP4 + E4M3.
+        tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
+            output,
+            quantizer_stat["key"]["lower_threshold"][i],
+            quantizer_stat["key"]["upper_threshold"][i],
+            args.quant_outlier,
+            use_group_shift=True,
+        )
+
+        sparsity_information["key"][i] = [
+            sum(x) for x in zip(sparsity_information["key"][i], sparsity)
+        ]
+        sparsity_information["counter"][i] += 1.0
+
+        return tensor.half()
+
+    for i, decoder in enumerate(model.get_decoder().layers):
+        decoder.self_attn.v_proj.register_forward_hook(
+            partial(tokenwise_quantize_activation_hook, i)
+        )
+        decoder.self_attn.k_proj.register_forward_hook(
+            partial(channelwise_quantize_activation_hook, i)
+        )
+
+    runner(args, model, tokenizer, device)
+
+    key_sparsity = []
+    key_sparsity_sum = [0.0 for _ in range(n_quant_group)]
+
+    for i in range(n_layer):
+        if sparsity_information["counter"][i] > 0:
+            layer_key_sparsity = [
+                x / sparsity_information["counter"][i]
+                for x in sparsity_information["key"][i]
+            ]
+        else:
+            layer_key_sparsity = [0.0 for _ in range(n_quant_group)]
+
+        key_sparsity.append(layer_key_sparsity)
+
+        print(
+            f"Decoder {i} Sparsity: "
+            f"Key - {key_sparsity[i]}, Value - plain FP4 + E4M3"
+        )
+
+        for idx, item in enumerate(key_sparsity[i]):
+            key_sparsity_sum[idx] += item
+
+    print(
+        "Total Sparsity: "
+        f"Key - {[x / n_layer for x in key_sparsity_sum]}, "
+        "Value - not applicable (plain FP4 + E4M3)"
     )
 
-    # Phase 2: Define quantization hooks.
-
-    def tokenwise_quantize_activation_hook(
-        i, module, inputs, output
-    ):
-        tensor = FP4E2M1E4M3Quantizer.quantize_dequantize(
-            output, block_size=64
-        )
-        return tensor.to(output.dtype)
-
-    def make_mixed_precision_k_hook(mask):
-        def mixed_precision_k_hook(module, inputs, output):
-            return MixedPrecisionKQuantizer.quantize_dequantize(
-                output, mask
-            ).to(output.dtype)
-
-        return mixed_precision_k_hook
-
-    # Phase 3: Apply quantization during evaluation.
-    handles = []
-
-    try:
-        for layer_idx, decoder in enumerate(
-            model.get_decoder().layers
-        ):
-            k_handle = decoder.self_attn.k_proj.register_forward_hook(
-                make_mixed_precision_k_hook(
-                    channel_masks[layer_idx]
-                )
-            )
-            handles.append(k_handle)
-
-            v_handle = decoder.self_attn.v_proj.register_forward_hook(
-                partial(
-                    tokenwise_quantize_activation_hook,
-                    layer_idx
-                )
-            )
-            handles.append(v_handle)
-
-        # Uses the existing eval_perplexity runner.
-        runner(args, model, tokenizer, device)
-
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    return channel_masks
 
 def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner):
     sparsity_information = {
