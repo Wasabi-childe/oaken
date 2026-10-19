@@ -28,38 +28,23 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         )
         return tensor.half()
 
-
-
-
     def channelwise_quantize_activation_hook(i, module, input, output):
-        # Expected projection output: [batch, sequence, hidden_size]
-        batch_size, seq_len, hidden_size = output.shape
-    
-        num_heads = model.config.num_attention_heads
-        head_dim = hidden_size // num_heads
-    
-        # Split hidden features into attention heads.
-        x = output.reshape(
-            batch_size, seq_len, num_heads, head_dim
-        ).float()
-    
-        # Rotate each head independently along its head dimension.
-        x = hadamard_transform(x)
-    
-        # Plain FP4 + E4M3 quantization; no Oaken outlier handling.
-        x = FP4E4M3Quantizer.quantize_dequantize(
-            x,
-            block_size=32
+        # K: retain Oaken thresholds, group shifting, and INT5 paths.
+        # The INT4 path inside downsample() is replaced by FP4 + E4M3.
+        tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
+            output,
+            quantizer_stat["key"]["lower_threshold"][i],
+            quantizer_stat["key"]["upper_threshold"][i],
+            args.quant_outlier,
+            use_group_shift=True,
         )
-    
-        # Inverse rotation.
-        x = hadamard_transform(x)
-    
-        # Restore the original projection-output shape.
-        return x.reshape(batch_size, seq_len, hidden_size).half()
 
+        sparsity_information["key"][i] = [
+            sum(x) for x in zip(sparsity_information["key"][i], sparsity)
+        ]
+        sparsity_information["counter"][i] += 1.0
 
-
+        return tensor.half()
 
     for i, decoder in enumerate(model.get_decoder().layers):
         decoder.self_attn.v_proj.register_forward_hook(
