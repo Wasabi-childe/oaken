@@ -23,9 +23,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     def tokenwise_quantize_activation_hook(i, module, input, output):
         # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
         tensor = FP4E4M3Quantizer.quantize_dequantize(
-            output,
-            scale_mode="group",
-            group_size=32
+            output
         )
         return tensor.half()
 
