@@ -195,6 +195,60 @@ class FP4E4M3Quantizer:
 
 
 
+class FP5E4M3Quantizer:
+    """
+    Custom FP5 E2M2 value quantization with E4M3 token-wise scales.
+
+    Each row (the last dimension of the input) gets one scale. The value
+    codebook uses sign + E2M2 magnitudes represented by the levels below.
+    This is a software-defined E2M2 codebook, not a claim of compatibility
+    with a specific vendor's FP5 hardware format.
+    """
+
+    @staticmethod
+    def quantize_dequantize(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.numel() == 0:
+            return tensor.clone()
+
+        original_shape = tensor.shape
+        original_dtype = tensor.dtype
+        last_dim = original_shape[-1]
+
+        # Flatten leading dimensions so each row represents one token vector.
+        x = tensor.float().reshape(-1, last_dim)
+
+        # One scale per token vector. The largest codebook magnitude is 7.
+        amax = x.abs().amax(dim=-1, keepdim=True)
+        scale = amax / 7.0
+        scale = torch.where(amax > 0, scale, torch.ones_like(scale))
+
+        # Store/use the represented E4M3 scale value.
+        scale = scale.to(torch.float8_e4m3fn).float().clamp_min(1e-8)
+
+        normalized = (x / scale).clamp(-7.0, 7.0)
+
+        # Non-negative magnitudes in the selected E2M2 codebook.
+        levels = torch.tensor(
+            [
+                0.0, 0.25, 0.5, 0.75,
+                1.0, 1.25, 1.5, 1.75,
+                2.0, 2.5, 3.0, 3.5,
+                4.0, 5.0, 6.0, 7.0,
+            ],
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        # Nearest-level rounding; ties select the lower listed level.
+        distances = (normalized.abs().unsqueeze(-1) - levels).abs()
+        indices = distances.argmin(dim=-1)
+        magnitude = levels[indices]
+        quantized = normalized.sign() * magnitude
+        reconstructed = quantized * scale
+
+        return reconstructed.reshape(original_shape).to(original_dtype)
+
+
 class OakenQuantizer:
     QUANTIZE_BITS = 4
     OUTLIER_BITS = 5
@@ -342,10 +396,10 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         if quantize_outlier:
 
-            # Quantize the inner-most group using FP4 + E4M3.
+            # K inliers: FP5 E2M2 values + one E4M3 scale per token vector.
             grouped_tensors[-1] = (
-                FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-1], scale_mode="group", group_size=32
+                FP5E4M3Quantizer.quantize_dequantize(
+                    grouped_tensors[-1]
                 )
             )
 
@@ -377,11 +431,12 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     higher_outlier -= threshold_upper_tensor
                     lower_outlier -= threshold_lower_tensor
 
-                # FP4 + E4M3 replaces INT5 for all outlier groups.
+                # K outliers: FP5 E2M2 values + token-wise E4M3 scale.
+                # The scale is computed over this masked outlier-group row.
                 total_outlier = (
-                    FP4E4M3Quantizer.quantize_dequantize(
+                    FP5E4M3Quantizer.quantize_dequantize(
                         higher_outlier * higher_mask
-                        + lower_outlier * lower_mask, scale_mode="group", group_size=16
+                        + lower_outlier * lower_mask
                     )
                 )
 
@@ -400,10 +455,11 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         else:
 
-            # Quantize the middle group using FP4 + E4M3.
+            # If outlier quantization is disabled, quantize the selected
+            # middle group using FP5 E2M2 with token-wise E4M3 scaling.
             grouped_tensors[-2] = (
-                FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-2], scale_mode="group", group_size=16
+                FP5E4M3Quantizer.quantize_dequantize(
+                    grouped_tensors[-2]
                 )
             )
 
