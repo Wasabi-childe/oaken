@@ -92,54 +92,29 @@ class FP4E2M1E4M3Quantizer:
 
 class FP2E1M0StyleQuantizer:
     BLOCK_SIZE = 32
+    CLIP = 0.42          # step = CLIP * block_amax; calibrate per layer by MSE
 
     @classmethod
-    def quantize_dequantize(cls, tensor, block_size=None):
+    def quantize_dequantize(cls, tensor, block_size=None, clip=None):
         if tensor.numel() == 0:
             return tensor.clone()
-
-        if block_size is None:
-            block_size = cls.BLOCK_SIZE
-
-        shape = tensor.shape
-        dtype = tensor.dtype
-
+        block_size = block_size or cls.BLOCK_SIZE
+        clip = cls.CLIP if clip is None else clip
+        shape, dtype = tensor.shape, tensor.dtype
         x = tensor.reshape(-1, shape[-1]).float()
         n, width = x.shape
-
         pad = (-width) % block_size
         if pad:
             x = F.pad(x, (0, pad))
-
         blocks = x.reshape(n, -1, block_size)
         amax = blocks.abs().amax(dim=-1, keepdim=True)
-
-        # One shared scale per block.
-        scale = amax.clamp(min=2.0 ** -9, max=448.0)
-        scale = scale.to(torch.float8_e4m3fn).float()
-
-        normalized = blocks / scale
-
-        # Exponent bit = 0 represents zero.
-        # Exponent bit = 1 represents magnitude 1 * scale.
-        nonzero = normalized.abs() >= 0.5
-
-        reconstructed = (
-            torch.sign(normalized)
-            * nonzero.float()
-            * scale
-        )
-
-        # Preserve exact zeros, including all-zero blocks.
-        reconstructed = torch.where(
-            blocks == 0,
-            torch.zeros_like(reconstructed),
-            reconstructed
-        )
-
-        reconstructed = reconstructed.reshape(n, -1)[:, :width]
-
-        return reconstructed.reshape(shape).to(dtype)
+        step = (clip * amax).clamp(min=2.0 ** -9, max=448.0)
+        step = step.to(torch.float8_e4m3fn).float()
+        q = torch.floor(blocks / step).clamp(-2, 1) + 0.5      # {-1.5,-0.5,0.5,1.5}
+        out = (q * step).reshape(n, -1)[:, :width]
+        out = torch.where(tensor.reshape(-1, shape[-1]).float() == 0,
+                          torch.zeros_like(out), out)           # keep exact zeros
+        return out.reshape(shape).to(dtype)
 
 
 # ================================================================
