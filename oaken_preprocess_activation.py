@@ -75,24 +75,27 @@ def multi_key_value_tokenwise_main(args, runner):
     quantizer_stat = {
         "n_quant_group": n_quant_group,
         "key": {
-            "upper_threshold": [[0.0 for j in range(n_quant_group)] for i in range(n_layer)],
-            "lower_threshold": [[0.0 for j in range(n_quant_group)] for i in range(n_layer)],
-        },
-        "value": {
-            "upper_threshold": [[0.0 for j in range(n_quant_group)] for i in range(n_layer)],
-            "lower_threshold": [[0.0 for j in range(n_quant_group)] for i in range(n_layer)],
+            "upper_threshold": [
+                [0.0 for _ in range(n_quant_group)]
+                for _ in range(n_layer)
+            ],
+            "lower_threshold": [
+                [0.0 for _ in range(n_quant_group)]
+                for _ in range(n_layer)
+            ],
         }
     }
     for i in range(n_layer):
         for j in range(n_quant_group):
-            quantizer_stat["key"]["upper_threshold"][i][j] = \
-                (stat["key"][i]["upper_threshold"][j] / stat["key"][i]["counter"])
-            quantizer_stat["key"]["lower_threshold"][i][j] = \
-                (stat["key"][i]["lower_threshold"][j] / stat["key"][i]["counter"])
-            quantizer_stat["value"]["upper_threshold"][i][j] = \
-                (stat["value"][i]["upper_threshold"][j] / stat["value"][i]["counter"])
-            quantizer_stat["value"]["lower_threshold"][i][j] = \
-                (stat["value"][i]["lower_threshold"][j] / stat["value"][i]["counter"])
+            quantizer_stat["key"]["upper_threshold"][i][j] = (
+                stat["key"][i]["upper_threshold"][j]
+                / stat["key"][i]["counter"]
+            )
+    
+            quantizer_stat["key"]["lower_threshold"][i][j] = (
+                stat["key"][i]["lower_threshold"][j]
+                / stat["key"][i]["counter"]
+            )
             
     end_time = time.monotonic()
     print(f"Elapsed time: {end_time - start_time} seconds")
