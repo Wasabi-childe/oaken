@@ -226,6 +226,7 @@ class OakenQuantizer:
         return truncated.view(torch.float16)
 
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(
@@ -245,12 +246,13 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         result_tensor = torch.zeros_like(input_tensor).half()
 
         if quantize_outlier:
-            # Innermost group: FP5.
-            grouped_tensors[-1] = FP5E4M3Quantizer.quantize_dequantize(
-                grouped_tensors[-1]
+            # Quantize the innermost group to FP4.
+            grouped_tensors[-1] = FP4E4M3Quantizer.quantize_dequantize(
+                grouped_tensors[-1],
+                scale_mode="token"
             )
 
-            # Outer groups: FP5, except the second-to-last outer group, FP4.
+            # Quantize every outer group to FP4.
             for idx in range(len(threshold_lowers) - 1):
                 low = torch.as_tensor(
                     threshold_lowers[idx],
@@ -274,15 +276,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     positive = positive - high
                     negative = negative - low
 
-                shifted = positive * positive_mask + negative * negative_mask
+                shifted = (
+                    positive * positive_mask
+                    + negative * negative_mask
+                )
 
-                if idx == len(threshold_lowers) - 2:
-                    quantized = FP4E4M3Quantizer.quantize_dequantize(
-                        shifted,
-                        scale_mode="token"
-                    )
-                else:
-                    quantized = FP5E4M3Quantizer.quantize_dequantize(shifted)
+                quantized = FP4E4M3Quantizer.quantize_dequantize(
+                    shifted,
+                    scale_mode="token"
+                )
 
                 positive_q = quantized * positive_mask
                 negative_q = quantized * negative_mask
@@ -291,10 +293,13 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     positive_q = positive_q + high
                     negative_q = negative_q + low
 
-                grouped_tensors[idx] = positive_q * positive_mask + negative_q * negative_mask
+                grouped_tensors[idx] = (
+                    positive_q * positive_mask
+                    + negative_q * negative_mask
+                )
 
         else:
-            # Middle group: FP4; other groups remain unquantized.
+            # Only the middle group is quantized to FP4.
             grouped_tensors[-2] = FP4E4M3Quantizer.quantize_dequantize(
                 grouped_tensors[-2],
                 scale_mode="token"
