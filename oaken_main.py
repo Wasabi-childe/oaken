@@ -28,23 +28,29 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         )
         return tensor.half()
 
+
     def channelwise_quantize_activation_hook(i, module, input, output):
-        # K: retain Oaken thresholds, group shifting, and INT5 paths.
-        # The INT4 path inside downsample() is replaced by FP4 + E4M3.
+        # K: Hadamard rotation -> Oaken grouping ->
+        # FP4 + E4M3 quantization -> inverse rotation.
         tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
             output,
             quantizer_stat["key"]["lower_threshold"][i],
             quantizer_stat["key"]["upper_threshold"][i],
             args.quant_outlier,
             use_group_shift=True,
+            apply_hadamard=True,
         )
-
+    
         sparsity_information["key"][i] = [
-            sum(x) for x in zip(sparsity_information["key"][i], sparsity)
+            sum(x) for x in zip(
+                sparsity_information["key"][i],
+                sparsity
+            )
         ]
         sparsity_information["counter"][i] += 1.0
-
+    
         return tensor.half()
+
 
     for i, decoder in enumerate(model.get_decoder().layers):
         decoder.self_attn.v_proj.register_forward_hook(
