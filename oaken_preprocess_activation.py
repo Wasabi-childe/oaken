@@ -9,7 +9,7 @@ from src.model import get_model
 from src.tokenizer import get_tokenizer
 from eval_perplexity import eval_perplexity
 from eval_workload import run_model
-
+from src.oaken.quantize import hadamard_transform
 
 def common_main(args):
     print("= Run Configuration ===================")
@@ -67,9 +67,11 @@ def multi_key_value_tokenwise_main(args, runner):
                 n_tokens, device=output.device
             )[:n_sampled]
 
-            output_float32 = output[:, sampled_indices, :].float()
+            output_float32 = hadamard_transform(
+            output[:, sampled_indices, :].float()
+        )
         else:
-            output_float32 = output.float()
+            output_float32 = hadamard_transform(output.float())
 
         accumulated_frac = 0.0
 
