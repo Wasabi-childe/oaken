@@ -123,7 +123,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     def tokenwise_quantize_activation_hook(
         i, module, inputs, output
     ):
-        tensor = FP4E4M3Quantizer.quantize_dequantize(
+        tensor = FP4E2M1E4M3Quantizer.quantize_dequantize(
             output, block_size=64
         )
         return tensor.to(output.dtype)
