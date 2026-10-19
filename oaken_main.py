@@ -29,27 +29,21 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         return tensor.half()
 
 
+
     def channelwise_quantize_activation_hook(i, module, input, output):
-        # K: Hadamard rotation -> Oaken grouping ->
-        # FP4 + E4M3 quantization -> inverse rotation.
-        tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
-            output,
-            quantizer_stat["key"]["lower_threshold"][i],
-            quantizer_stat["key"]["upper_threshold"][i],
-            args.quant_outlier,
-            use_group_shift=True,
-            apply_hadamard=True,
+        # K: Hadamard rotation -> plain FP4 + E4M3 quantization
+        # -> inverse Hadamard rotation.
+        rotated = hadamard_transform(output.float())
+    
+        tensor = FP4E4M3Quantizer.quantize_dequantize(
+            rotated,
+            block_size=64
         )
     
-        sparsity_information["key"][i] = [
-            sum(x) for x in zip(
-                sparsity_information["key"][i],
-                sparsity
-            )
-        ]
-        sparsity_information["counter"][i] += 1.0
+        tensor = hadamard_transform(tensor)
     
         return tensor.half()
+
 
 
     for i, decoder in enumerate(model.get_decoder().layers):
