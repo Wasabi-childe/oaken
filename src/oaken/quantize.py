@@ -374,112 +374,112 @@ class OakenQuantizer:
 
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
-@classmethod
-def downsample(
-    cls,
-    input_tensor: torch.Tensor,
-    threshold_lowers: list[float],
-    threshold_uppers: list[float],
-    quantize_outlier: bool = True,
-    use_group_shift: bool = True,
-    is_key: bool = True
-) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-
-    # V: quantize the complete tensor using FP4.
-    # No threshold grouping and no outlier handling.
-    if not is_key:
-        result_tensor = FP4E4M3Quantizer.quantize_dequantize(
+    @classmethod
+    def downsample(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float],
+        quantize_outlier: bool = True,
+        use_group_shift: bool = True,
+        is_key: bool = True
+    ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
+    
+        # V: quantize the complete tensor using FP4.
+        # No threshold grouping and no outlier handling.
+        if not is_key:
+            result_tensor = FP4E4M3Quantizer.quantize_dequantize(
+                input_tensor,
+                scale_mode="token"
+            )
+    
+            val_frac = [1.0]
+            heat_map = None
+    
+            return result_tensor, val_frac, heat_map
+    
+        # K: split into threshold groups.
+        grouped_tensors, masks = cls.get_multigroup_threshold(
             input_tensor,
-            scale_mode="token"
+            threshold_lowers,
+            threshold_uppers
         )
-
-        val_frac = [1.0]
-        heat_map = None
-
-        return result_tensor, val_frac, heat_map
-
-    # K: split into threshold groups.
-    grouped_tensors, masks = cls.get_multigroup_threshold(
-        input_tensor,
-        threshold_lowers,
-        threshold_uppers
-    )
-
-    result_tensor = torch.zeros_like(input_tensor).half()
-
-    # Quantize the middle group using FP4.
-    middle_idx = len(grouped_tensors) - 2
-
-    grouped_tensors[middle_idx] = (
-        FP4E4M3Quantizer.quantize_dequantize(
-            grouped_tensors[middle_idx],
-            scale_mode="token"
+    
+        result_tensor = torch.zeros_like(input_tensor).half()
+    
+        # Quantize the middle group using FP4.
+        middle_idx = len(grouped_tensors) - 2
+    
+        grouped_tensors[middle_idx] = (
+            FP4E4M3Quantizer.quantize_dequantize(
+                grouped_tensors[middle_idx],
+                scale_mode="token"
+            )
         )
-    )
-
-    # Quantize only the outer outlier groups using FP5.
-    if quantize_outlier:
-        for idx in range(len(grouped_tensors)):
-            if idx == middle_idx:
-                continue
-
-            group = grouped_tensors[idx]
-
-            if use_group_shift:
-                low = torch.tensor(
-                    threshold_lowers[idx],
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype
-                ) if idx < len(threshold_lowers) else None
-
-                high = torch.tensor(
-                    threshold_uppers[idx],
-                    device=input_tensor.device,
-                    dtype=input_tensor.dtype
-                ) if idx < len(threshold_uppers) else None
-
-                positive_mask = group > 0
-                negative_mask = group < 0
-
-                shifted = group.clone()
-
-                if high is not None:
-                    shifted = torch.where(
-                        positive_mask, group - high, shifted
+    
+        # Quantize only the outer outlier groups using FP5.
+        if quantize_outlier:
+            for idx in range(len(grouped_tensors)):
+                if idx == middle_idx:
+                    continue
+    
+                group = grouped_tensors[idx]
+    
+                if use_group_shift:
+                    low = torch.tensor(
+                        threshold_lowers[idx],
+                        device=input_tensor.device,
+                        dtype=input_tensor.dtype
+                    ) if idx < len(threshold_lowers) else None
+    
+                    high = torch.tensor(
+                        threshold_uppers[idx],
+                        device=input_tensor.device,
+                        dtype=input_tensor.dtype
+                    ) if idx < len(threshold_uppers) else None
+    
+                    positive_mask = group > 0
+                    negative_mask = group < 0
+    
+                    shifted = group.clone()
+    
+                    if high is not None:
+                        shifted = torch.where(
+                            positive_mask, group - high, shifted
+                        )
+    
+                    if low is not None:
+                        shifted = torch.where(
+                            negative_mask, group - low, shifted
+                        )
+    
+                    quantized = FP5E4M3Quantizer.quantize_dequantize(
+                        shifted
                     )
-
-                if low is not None:
-                    shifted = torch.where(
-                        negative_mask, group - low, shifted
+    
+                    if high is not None:
+                        quantized = torch.where(
+                            positive_mask, quantized + high, quantized
+                        )
+    
+                    if low is not None:
+                        quantized = torch.where(
+                            negative_mask, quantized + low, quantized
+                        )
+    
+                    grouped_tensors[idx] = quantized
+                else:
+                    grouped_tensors[idx] = (
+                        FP5E4M3Quantizer.quantize_dequantize(group)
                     )
-
-                quantized = FP5E4M3Quantizer.quantize_dequantize(
-                    shifted
-                )
-
-                if high is not None:
-                    quantized = torch.where(
-                        positive_mask, quantized + high, quantized
-                    )
-
-                if low is not None:
-                    quantized = torch.where(
-                        negative_mask, quantized + low, quantized
-                    )
-
-                grouped_tensors[idx] = quantized
-            else:
-                grouped_tensors[idx] = (
-                    FP5E4M3Quantizer.quantize_dequantize(group)
-                )
-
-    # Reconstruct using the original masks.
-    for group, mask in zip(grouped_tensors, masks):
-        result_tensor += (group * mask).to(result_tensor.dtype)
-
-    val_frac = [
-        (torch.count_nonzero(mask) / mask.numel()).item()
-        for mask in masks
-    ]
-
-    return result_tensor, val_frac, None
+    
+        # Reconstruct using the original masks.
+        for group, mask in zip(grouped_tensors, masks):
+            result_tensor += (group * mask).to(result_tensor.dtype)
+    
+        val_frac = [
+            (torch.count_nonzero(mask) / mask.numel()).item()
+            for mask in masks
+        ]
+    
+        return result_tensor, val_frac, None
