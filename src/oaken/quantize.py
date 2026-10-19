@@ -1,38 +1,33 @@
 
 import torch
-from typing import Optional
-
-
-import torch
 import torch.nn.functional as F
 
+
+# ================================================================
+# FP4 E2M1 + E4M3 BLOCK-SCALE QUANTIZER
+# ================================================================
+
 def _e2m1_round_magnitude(m):
-    levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                          device=m.device, dtype=m.dtype)
-    idx = ((m > 0.25).long() + (m >= 0.75).long() + (m > 1.25).long()
-           + (m >= 1.75).long() + (m > 2.5).long() + (m >= 3.5).long()
-           + (m > 5.0).long())
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=m.device,
+        dtype=m.dtype
+    )
+
+    idx = (
+        (m > 0.25).long()
+        + (m >= 0.75).long()
+        + (m > 1.25).long()
+        + (m >= 1.75).long()
+        + (m > 2.5).long()
+        + (m >= 3.5).long()
+        + (m > 5.0).long()
+    )
+
     return levels[idx]
 
-class FP4Quantizer:
-    @classmethod
-    def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.numel() == 0:
-            return tensor.clone()
 
-        shape = tensor.shape
-        dtype = tensor.dtype
-
-        x = tensor.float()
-
-        # No scaling: quantize directly to the E2M1 FP4 codebook.
-        mag = _e2m1_round_magnitude(x.abs().clamp(max=6.0))
-        out = torch.copysign(mag, x)
-
-        return out.reshape(shape).to(dtype)
-
-
-class FP4E4M3Quantizer:
+class FP4E2M1E4M3Quantizer:
     BLOCK_SIZE = 32
 
     @classmethod
@@ -43,250 +38,284 @@ class FP4E4M3Quantizer:
         if block_size is None:
             block_size = cls.BLOCK_SIZE
 
-        shape, dtype = tensor.shape, tensor.dtype
-        x = tensor.reshape(-1, shape[-1]).float()
-        n, w = x.shape
+        shape = tensor.shape
+        dtype = tensor.dtype
 
-        pad = (-w) % block_size
+        # Treat each row independently. Quantization blocks run
+        # along the last dimension.
+        x = tensor.reshape(-1, shape[-1]).float()
+        n, width = x.shape
+
+        pad = (-width) % block_size
         if pad:
             x = F.pad(x, (0, pad))
 
         blocks = x.reshape(n, -1, block_size)
         amax = blocks.abs().amax(dim=-1, keepdim=True)
 
-        scale = (amax / 6.0).clamp(min=2.0**-9, max=448.0)
+        # E4M3 scale for each block.
+        scale = (amax / 6.0).clamp(
+            min=2.0 ** -9,
+            max=448.0
+        )
         scale = scale.to(torch.float8_e4m3fn).float()
 
         normalized = blocks / scale
-        mag = _e2m1_round_magnitude(normalized.abs().clamp(max=6.0))
-        out = torch.copysign(mag, normalized) * scale
+        magnitude = _e2m1_round_magnitude(
+            normalized.abs().clamp(max=6.0)
+        )
 
-        out = out.reshape(n, -1)[:, :w]
-        return out.reshape(shape).to(dtype)
+        reconstructed = torch.copysign(
+            magnitude, normalized
+        ) * scale
 
-class OakenQuantizer:
-    QUANTIZE_BITS = 4
-    OUTLIER_BITS = 5
-    FLOAT_TOLERANCE = 1e-6
+        reconstructed = reconstructed.reshape(n, -1)[:, :width]
+
+        return reconstructed.reshape(shape).to(dtype)
+
+
+# ================================================================
+# CUSTOM FP2 E1M0-STYLE QUANTIZER
+#
+# Explicit encoding:
+#   00 = +0
+#   10 = -0 (reconstructed as zero)
+#   01 = +1 * block_scale
+#   11 = -1 * block_scale
+#
+# The exponent bit is 0 for zero and 1 for a nonzero value.
+# There is no mantissa bit. This is a custom ternary format,
+# not a standard IEEE or industry-standard FP2 format.
+#
+# Values below half the block maximum are rounded to zero.
+# ================================================================
+
+class FP2E1M0StyleQuantizer:
+    BLOCK_SIZE = 32
 
     @classmethod
-    def get_outlier_threshold(
-        cls,
-        input_tensor: torch.Tensor,
-        threshold_lower: float,
-        threshold_upper: float
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def quantize_dequantize(cls, tensor, block_size=None):
+        if tensor.numel() == 0:
+            return tensor.clone()
 
-        outlier_mask = torch.logical_or(
-            input_tensor <= threshold_lower,
-            threshold_upper <= input_tensor
+        if block_size is None:
+            block_size = cls.BLOCK_SIZE
+
+        shape = tensor.shape
+        dtype = tensor.dtype
+
+        x = tensor.reshape(-1, shape[-1]).float()
+        n, width = x.shape
+
+        pad = (-width) % block_size
+        if pad:
+            x = F.pad(x, (0, pad))
+
+        blocks = x.reshape(n, -1, block_size)
+        amax = blocks.abs().amax(dim=-1, keepdim=True)
+
+        # One shared scale per block.
+        scale = amax.clamp(min=2.0 ** -9, max=448.0)
+        scale = scale.to(torch.float8_e4m3fn).float()
+
+        normalized = blocks / scale
+
+        # Exponent bit = 0 represents zero.
+        # Exponent bit = 1 represents magnitude 1 * scale.
+        nonzero = normalized.abs() >= 0.5
+
+        reconstructed = (
+            torch.sign(normalized)
+            * nonzero.float()
+            * scale
         )
 
-        outlier = input_tensor * outlier_mask
-        inlier = input_tensor * ~outlier_mask
+        # Preserve exact zeros, including all-zero blocks.
+        reconstructed = torch.where(
+            blocks == 0,
+            torch.zeros_like(reconstructed),
+            reconstructed
+        )
 
-        return inlier, outlier, outlier_mask
+        reconstructed = reconstructed.reshape(n, -1)[:, :width]
+
+        return reconstructed.reshape(shape).to(dtype)
+
+
+# ================================================================
+# MIXED-PRECISION K CHANNEL QUANTIZER
+#
+# Input shape: [batch, tokens, channels] or [tokens, channels]
+#
+# Calibration:
+#   1. Compute mean absolute magnitude per channel.
+#   2. Select the top 25% channels for FP4.
+#   3. Assign all other channels to FP2.
+#
+# Application:
+#   FP4 channels -> FP4 E2M1 + E4M3 block scales
+#   FP2 channels -> custom FP2 E1M0-style quantizer
+#
+# No Oaken outlier thresholds or group shifting.
+# ================================================================
+
+class MixedPrecisionKQuantizer:
+    FP4_FRACTION = 0.25
+    BLOCK_SIZE = 32
 
     @classmethod
-    def get_multigroup_threshold(
-        cls,
-        input_tensor: torch.Tensor,
-        threshold_lowers: list[float],
-        threshold_uppers: list[float]
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    def compute_channel_mask(cls, calibration_k):
+        """
+        calibration_k:
+            [tokens, channels] or [batch, tokens, channels]
 
-        group_masks = list()
-        group_tensors = list()
-        prev_thr_low, prev_thr_up = None, None
-
-        for idx, (thr_low, thr_up) in enumerate(
-            zip(threshold_lowers, threshold_uppers)
-        ):
-            if idx == len(threshold_lowers) - 1:
-                # Inner-most Group
-                group_masks.append(
-                    mask := torch.logical_and(
-                        input_tensor > prev_thr_low,
-                        input_tensor < prev_thr_up
-                    )
-                )
-
-            elif (
-                prev_thr_low is not None
-                and prev_thr_up is not None
-            ):
-                group_masks.append(
-                    mask := torch.logical_or(
-                        torch.logical_and(
-                            prev_thr_low < input_tensor,
-                            input_tensor <= thr_low
-                        ),
-                        torch.logical_and(
-                            thr_up <= input_tensor,
-                            input_tensor < prev_thr_up
-                        )
-                    )
-                )
-
-            else:
-                # Outer-most Group
-                group_masks.append(
-                    mask := torch.logical_or(
-                        input_tensor <= thr_low,
-                        thr_up <= input_tensor
-                    )
-                )
-
-            prev_thr_low = thr_low
-            prev_thr_up = thr_up
-
-            group_tensors.append(input_tensor * mask)
-
-        assert (
-            len(threshold_lowers)
-            == len(threshold_uppers)
-            == len(group_tensors)
-            == len(group_masks)
-        )
-
-        return group_tensors, group_masks
-
-    @staticmethod
-    def uniform_quantization_threshold(
-        tensor,
-        bits: int,
-        minval: torch.Tensor,
-        maxval: torch.Tensor
-    ):
-        rangeval = maxval - minval
-        qx = (2 ** bits - 1) / rangeval
-        offset = minval * qx
-
-        quantized = torch.round(qx * tensor - offset)
-        quantized = torch.nan_to_num(
-            quantized,
-            nan=2 ** bits - 1
-        )
-
-        return (quantized + offset) / qx
-
-    @staticmethod
-    def uniform_quantization(tensor, bits: int):
-        maxval = torch.max(tensor).cpu().item()
-        minval = torch.min(tensor).cpu().item()
-
-        return OakenQuantizer.uniform_quantization_threshold(
-            tensor, bits, minval, maxval
-        )
-
-    @classmethod
-    def downsample_mantissa(cls, tensor):
-        int16_tensor = tensor.view(torch.int16)
-        truncated = int16_tensor & 0b1_11111_1110_0000_00
-        return truncated.view(torch.float16)
-
-
-
-class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
-
-    @classmethod
-    def downsample(
-        cls,
-        input_tensor: torch.Tensor,
-        threshold_lowers: list[float],
-        threshold_uppers: list[float],
-        quantize_outlier: bool = False,
-        use_group_shift: bool = True
-    ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-
-        grouped_tensors, masks = cls.get_multigroup_threshold(
-            input_tensor,
-            threshold_lowers,
-            threshold_uppers
-        )
-
-        result_tensor = torch.zeros_like(input_tensor).to(
-            input_tensor.device
-        ).half()
-
-        if quantize_outlier:
-
-            # Quantize the inner-most group using FP4 + E4M3.
-            grouped_tensors[-1] = (
-                FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-1]
-                )
+        Returns:
+            Boolean mask of shape [channels].
+            True  -> FP4
+            False -> FP2
+        """
+        if calibration_k.ndim not in (2, 3):
+            raise ValueError(
+                "Expected K tensor with shape [tokens, channels] "
+                "or [batch, tokens, channels]."
             )
 
-            # Quantize the outer groups using FP4 + E4M3.
-            for idx in range(len(threshold_lowers) - 1):
+        # Average across all dimensions except the channel axis.
+        reduce_dims = tuple(range(calibration_k.ndim - 1))
+        scores = calibration_k.float().abs().mean(dim=reduce_dims)
 
-                threshold_lower_tensor = torch.tensor(
-                    threshold_lowers[idx],
-                    device=input_tensor.device
-                ).half()
+        num_channels = scores.numel()
+        num_fp4 = max(
+            1,
+            min(
+                num_channels,
+                int(num_channels * cls.FP4_FRACTION + 0.5)
+            )
+        )
 
-                threshold_upper_tensor = torch.tensor(
-                    threshold_uppers[idx],
-                    device=input_tensor.device
-                ).half()
+        selected_indices = torch.topk(
+            scores, k=num_fp4, largest=True
+        ).indices
 
-                higher_mask = grouped_tensors[idx] > 0
-                lower_mask = grouped_tensors[idx] < 0
+        channel_mask = torch.zeros(
+            num_channels,
+            dtype=torch.bool,
+            device=calibration_k.device
+        )
+        channel_mask[selected_indices] = True
 
-                higher_outlier = (
-                    grouped_tensors[idx] * higher_mask
-                )
-                lower_outlier = (
-                    grouped_tensors[idx] * lower_mask
-                )
+        return channel_mask
 
-                # Preserve the original group-shifting behavior.
-                if use_group_shift:
-                    higher_outlier -= threshold_upper_tensor
-                    lower_outlier -= threshold_lower_tensor
+    @classmethod
+    def quantize_dequantize(cls, k_tensor, channel_mask):
+        """
+        k_tensor:
+            K tensor with shape [tokens, channels] or
+            [batch, tokens, channels].
 
-                # FP4 + E4M3 replaces INT5 for all outlier groups.
-                total_outlier = (
-                    FP4E4M3Quantizer.quantize_dequantize(
-                        higher_outlier * higher_mask
-                        + lower_outlier * lower_mask
-                    )
-                )
+        channel_mask:
+            Boolean mask calculated using compute_channel_mask().
+            True = FP4; False = FP2.
 
-                higher_outlier = total_outlier * higher_mask
-                lower_outlier = total_outlier * lower_mask
-
-                # Restore the original threshold offsets.
-                if use_group_shift:
-                    higher_outlier += threshold_upper_tensor
-                    lower_outlier += threshold_lower_tensor
-
-                grouped_tensors[idx] = (
-                    higher_outlier * higher_mask
-                    + lower_outlier * lower_mask
-                )
-
-        else:
-
-            # Quantize the middle group using FP4 + E4M3.
-            grouped_tensors[-2] = (
-                FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-2]
-                )
+        Returns:
+            Reconstructed K tensor, same shape and dtype as input.
+        """
+        if k_tensor.ndim not in (2, 3):
+            raise ValueError(
+                "Expected K tensor with shape [tokens, channels] "
+                "or [batch, tokens, channels]."
             )
 
-        # Reconstruct the result using the original group masks.
-        for tensor, mask in zip(grouped_tensors, masks):
-            result_tensor += tensor * mask
+        if k_tensor.shape[-1] != channel_mask.numel():
+            raise ValueError(
+                "Channel mask length must match the last dimension "
+                "of the K tensor."
+            )
 
-        heat_map = None
+        mask = channel_mask.to(
+            device=k_tensor.device, dtype=torch.bool
+        )
 
-        val_frac = [
-            (
-                torch.count_nonzero(mask) / torch.numel(mask)
-            ).item()
-            for mask in masks
-        ]
+        result = torch.empty_like(k_tensor)
 
-        return result_tensor, val_frac, heat_map
+        fp4_indices = torch.where(mask)[0]
+        fp2_indices = torch.where(~mask)[0]
+
+        # Gather selected channels, quantize, then restore positions.
+        if fp4_indices.numel() > 0:
+            fp4_values = k_tensor.index_select(
+                -1, fp4_indices
+            )
+
+            fp4_values = FP4E2M1E4M3Quantizer.quantize_dequantize(
+                fp4_values,
+                block_size=cls.BLOCK_SIZE
+            )
+
+            result.index_copy_(-1, fp4_indices, fp4_values)
+
+        if fp2_indices.numel() > 0:
+            fp2_values = k_tensor.index_select(
+                -1, fp2_indices
+            )
+
+            fp2_values = FP2E1M0StyleQuantizer.quantize_dequantize(
+                fp2_values,
+                block_size=cls.BLOCK_SIZE
+            )
+
+            result.index_copy_(-1, fp2_indices, fp2_values)
+
+        return result
+
+    @classmethod
+    def quantize_with_calibration(cls, calibration_k, k_tensor):
+        """
+        Convenience method:
+          1. Compute the mask from calibration K.
+          2. Apply the same mask to k_tensor.
+
+        The calibration and application tensors must have the
+        same number of channels, but may have different token counts.
+        """
+        channel_mask = cls.compute_channel_mask(calibration_k)
+
+        quantized_k = cls.quantize_dequantize(
+            k_tensor, channel_mask
+        )
+
+        return quantized_k, channel_mask
+
+
+# ================================================================
+# QUICK TEST
+# ================================================================
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+    # Example calibration and evaluation K tensors.
+    # Replace these with actual K projection/cache tensors.
+    calibration_k = torch.randn(1, 128, 512, dtype=torch.float16)
+    evaluation_k = torch.randn(1, 64, 512, dtype=torch.float16)
+
+    quantized_k, channel_mask = (
+        MixedPrecisionKQuantizer.quantize_with_calibration(
+            calibration_k,
+            evaluation_k
+        )
+    )
+
+    print("Original shape:", evaluation_k.shape)
+    print("Quantized shape:", quantized_k.shape)
+    print("FP4 channels:", int(channel_mask.sum().item()))
+    print("FP2 channels:", int((~channel_mask).sum().item()))
+    print("FP4 channel fraction:", channel_mask.float().mean().item())
+    print("Original dtype:", evaluation_k.dtype)
+    print("Output dtype:", quantized_k.dtype)
+
+    mse = (
+        evaluation_k.float() - quantized_k.float()
+    ).pow(2).mean().item()
+
+    print("Quantization MSE:", mse)
