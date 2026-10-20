@@ -61,7 +61,7 @@ def plot_shifted_normalized_distributions(
                     group_name = "middle"
 
                 # Separate original values into Oaken's three groups.
-                
+                masks = get_group_masks(rows, lower, upper)
                 group_names = ["outer", "middle", "inner"]
                 
                 for group_name, mask in zip(group_names, group_masks):
