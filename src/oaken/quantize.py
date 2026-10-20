@@ -1,147 +1,197 @@
+
 import torch
 from typing import Optional
 
+
 class OakenQuantizer:
-    QUANTIZE_BITS = 4
-    OUTLIER_BITS = 5
-    FLOAT_TOLERANCE = 1e-6
+    # NVFP4 parameters
+    BLOCK_SIZE = 16
+    FP4_MAX = 6.0
+    E4M3_MAX = 448.0
 
-
-    
-    @classmethod
-    def get_outlier_threshold(cls, input_tensor: torch.Tensor, threshold_lower: float, threshold_upper: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        outlier_mask = torch.logical_or(input_tensor <= threshold_lower, threshold_upper <= input_tensor)
-
-        outlier = input_tensor * outlier_mask
-        inlier = input_tensor * ~outlier_mask
-
-        return inlier, outlier, outlier_mask
-
-    @classmethod
-    def get_multigroup_threshold(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        group_masks = list()
-        group_tensors = list()
-        prev_thr_low, prev_thr_up = None, None
-        for idx, (thr_low, thr_up) in enumerate(zip(threshold_lowers, threshold_uppers)):
-            if idx == len(threshold_lowers) - 1: 
-                # Inner-most Group
-                group_masks.append(mask := torch.logical_and(input_tensor > prev_thr_low, input_tensor < prev_thr_up))
-            elif (prev_thr_low is not None) and (prev_thr_up is not None):
-                group_masks.append(mask := torch.logical_or(
-                    torch.logical_and(prev_thr_low < input_tensor, input_tensor <= thr_low),
-                    torch.logical_and(thr_up <= input_tensor, input_tensor < prev_thr_up))
-                )
-            else:
-                # Outer-most Group
-                group_masks.append(mask := torch.logical_or(               input_tensor <= thr_low, thr_up <= input_tensor))
-            prev_thr_low = thr_low
-            prev_thr_up = thr_up
-
-            group_tensors.append(input_tensor * mask)
-
-        assert(len(threshold_lowers) == len(threshold_uppers) == len(group_tensors) == len(group_masks))
-        return group_tensors, group_masks
-    
-    @staticmethod
-    def uniform_quantization_threshold(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
-        rangeval = maxval - minval
-        qx = (2 ** bits - 1) / rangeval
-        offset = minval * qx
-        quantized = torch.round(qx * tensor - offset)
-        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
-        return (quantized + offset) / qx
+    # Positive E2M1 magnitudes
+    E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
     @staticmethod
-    def uniform_quantization(tensor, bits: int):
-        maxval = torch.max(tensor).cpu().item()
-        minval = torch.min(tensor).cpu().item()
-        return OakenQuantizer.uniform_quantization_threshold(tensor, bits, minval, maxval)
+    def nvfp4_quantize_dequantize(
+        input_tensor: torch.Tensor,
+        return_metadata: bool = False
+    ):
+        """
+        NVFP4-style quantize/dequantize simulation.
 
+        - E2M1 values: 4 bits per value
+        - E4M3 block scale: one per 16 consecutive values
+        - FP32 global scale: one per tensor
+        - Blocks are formed along the last dimension.
+        - Returns reconstructed values in the input dtype.
 
-    @staticmethod
-    def e4m3_quantization(tensor, bits: int, maxval=None):
-        # One scale per row/token, along the last dimension
-        qmax = 2 ** (bits - 1) - 1
-    
-        amax = tensor.abs().amax(dim=-1, keepdim=True)
-        scale = amax / qmax
-    
-        # Store the scale in E4M3 format
-        scale = scale.to(torch.float8_e4m3fn).to(tensor.dtype)
-        scale = scale.clamp_min(1e-8)
-    
-        # Quantize to signed integer levels
-        normalized = tensor / scale
-        quantized = torch.round(normalized).clamp(-qmax, qmax)
-    
-        reconstructed = quantized * scale
+        This simulates numerical quantization. It does not pack
+        the E2M1 values into a physical 4-bit memory representation.
+        """
+
+        if not input_tensor.is_floating_point():
+            raise TypeError("input_tensor must have a floating-point dtype")
+
+        original_shape = input_tensor.shape
+        original_dtype = input_tensor.dtype
+        device = input_tensor.device
+
+        if input_tensor.numel() == 0:
+            raise ValueError("input_tensor must not be empty")
+
+        if not torch.isfinite(input_tensor).all():
+            raise ValueError("input_tensor must contain only finite values")
+
+        # Use FP32 for scale calculation and quantization.
+        x = input_tensor.to(torch.float32)
+
+        # The last dimension is divided into blocks of 16.
+        last_dim = x.shape[-1]
+        pad_size = (-last_dim) % OakenQuantizer.BLOCK_SIZE
+
+        if pad_size > 0:
+            x = torch.nn.functional.pad(x, (0, pad_size))
+
+        padded_last_dim = x.shape[-1]
+        n_blocks = padded_last_dim // OakenQuantizer.BLOCK_SIZE
+
+        # Reshape into blocks along the last dimension.
+        blocks = x.reshape(
+            *x.shape[:-1],
+            n_blocks,
+            OakenQuantizer.BLOCK_SIZE
+        )
+
+        # -------------------------------------------------
+        # Level 1: one FP32 global scale for the tensor
+        # -------------------------------------------------
+        global_amax = x.abs().amax()
+
+        if global_amax.item() == 0:
+            global_scale = torch.ones(
+                (), device=device, dtype=torch.float32
+            )
+
+            block_scale = torch.zeros_like(
+                blocks[..., :1]
+            )
+
+            reconstructed = torch.zeros_like(blocks)
+
+        else:
+            global_scale = global_amax / (
+                OakenQuantizer.E4M3_MAX *
+                OakenQuantizer.FP4_MAX
+            )
+
+            # ---------------------------------------------
+            # Level 2: one E4M3 scale per 16-value block
+            # ---------------------------------------------
+            block_amax = blocks.abs().amax(
+                dim=-1, keepdim=True
+            )
+
+            block_scale_fp32 = (
+                block_amax /
+                OakenQuantizer.FP4_MAX /
+                global_scale
+            )
+
+            # Store/simulate the local scale in E4M3.
+            block_scale = block_scale_fp32.to(
+                torch.float8_e4m3fn
+            ).to(torch.float32)
+
+            # Reconstruct the effective scale.
+            effective_scale = block_scale * global_scale
+
+            # Avoid division by zero for zero-valued blocks.
+            safe_scale = torch.where(
+                effective_scale > 0,
+                effective_scale,
+                torch.ones_like(effective_scale)
+            )
+
+            # Normalize the values for E2M1 quantization.
+            normalized = blocks / safe_scale
+
+            # E2M1 quantizes magnitudes to:
+            # 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+            levels = torch.tensor(
+                OakenQuantizer.E2M1_LEVELS,
+                device=device,
+                dtype=torch.float32
+            )
+
+            distances = (
+                normalized.abs().unsqueeze(-1) -
+                levels
+            ).abs()
+
+            # Select the nearest representable magnitude.
+            indices = distances.argmin(dim=-1)
+
+            quantized_magnitude = levels[indices]
+
+            # Restore sign and apply both scaling factors.
+            reconstructed = (
+                normalized.sign()
+                * quantized_magnitude
+                * effective_scale
+            )
+
+        # Restore the original tensor shape.
+        reconstructed = reconstructed.reshape(
+            *x.shape[:-1], padded_last_dim
+        )
+
+        if pad_size > 0:
+            reconstructed = reconstructed[..., :last_dim]
+
+        reconstructed = reconstructed.reshape(original_shape)
+        reconstructed = reconstructed.to(original_dtype)
+
+        if return_metadata:
+            metadata = {
+                "global_scale": global_scale,
+                "block_scale": block_scale,
+                "block_size": OakenQuantizer.BLOCK_SIZE,
+                "format": "NVFP4-style E2M1 + E4M3",
+            }
+            return reconstructed, metadata
+
         return reconstructed
-    
-    @classmethod
-    def downsample_mantissa(cls, tensor):
-        int16_tensor = tensor.view(torch.int16)
-        truncated = int16_tensor & 0b1_11111_1110_0000_00
-        return truncated.view(torch.float16)
+
 
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
     @classmethod
-    def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
-                    quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
-        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+    def downsample(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: Optional[list[float]] = None,
+        threshold_uppers: Optional[list[float]] = None,
+        quantize_outlier: bool = False,
+        use_group_shift: bool = True
+    ) -> tuple[torch.Tensor, list[float], None]:
+        """
+        Compatibility wrapper for the previous Oaken interface.
 
-        if quantize_outlier:
-            # Quantize inner-most group
-            minval_tensor = torch.min(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-1], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-1] = cls.e4m3_quantization(
-            grouped_tensors[-1], cls.OUTLIER_BITS
-        )
+        Thresholds, quantize_outlier and use_group_shift are retained
+        so existing calls do not fail, but are intentionally ignored:
+        NVFP4 quantizes the entire tensor without Oaken threshold groups.
 
-            # Quantize outer groups
-            for idx in range(len(threshold_lowers) - 1):
-                threshold_lower_tensor = torch.tensor(threshold_lowers[idx]).to(input_tensor.device).half()
-                threshold_upper_tensor = torch.tensor(threshold_uppers[idx]).to(input_tensor.device).half()
+        Returns:
+            reconstructed tensor,
+            [1.0] as a compatibility placeholder,
+            None as the heat map.
+        """
 
-                higher_mask = grouped_tensors[idx] > 0
-                lower_mask = grouped_tensors[idx] < 0
-                higher_outlier = grouped_tensors[idx] * higher_mask
-                lower_outlier = grouped_tensors[idx] * lower_mask
+        reconstructed = cls.nvfp4_quantize_dequantize(input_tensor)
 
-                if use_group_shift:
-                    higher_outlier -= threshold_upper_tensor
-                    lower_outlier -= threshold_lower_tensor
-
-                if idx == len(threshold_lowers) - 2:
-                    total_outlier = cls.e4m3_quantization(
-                    higher_outlier * higher_mask + lower_outlier * lower_mask,
-                    cls.QUANTIZE_BITS if idx == len(threshold_lowers) - 2
-                    else cls.OUTLIER_BITS
-                )
-                else:
-                    total_outlier = cls.uniform_quantization(higher_outlier * higher_mask + lower_outlier * lower_mask, cls.OUTLIER_BITS)
-
-                higher_outlier = total_outlier * higher_mask
-                lower_outlier = total_outlier * lower_mask
-                
-                if use_group_shift:
-                    higher_outlier += threshold_upper_tensor
-                    lower_outlier += threshold_lower_tensor
-
-                grouped_tensors[idx] = (higher_outlier * higher_mask) + (lower_outlier * lower_mask)
-        else:
-            # Quantize middle_group
-            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-2] = cls.e4m3_quantization(
-            grouped_tensors[-2], cls.QUANTIZE_BITS
-        )
-
-        # heat_map = torch.zeros_like(input_tensor)
-        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
-            result_tensor += tensor * mask
-            # heat_map += idx * mask
+        # NVFP4 does not use Oaken's outer/middle/inner groups.
+        val_frac = [1.0]
         heat_map = None
 
-        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
-        return (result_tensor, val_frac, heat_map)
+        return reconstructed, val_frac, heat_map
