@@ -60,36 +60,38 @@ def plot_shifted_normalized_distributions(
                 else:
                     group_name = "middle"
 
-                shifted = shift_group(
-                    rows,
-                    mask,
-                    group_idx,
-                    lower,
-                    upper,
-                )
-
-                scale, amax = tokenwise_e4m3_scale(
-                    shifted, mask
-                )
-
-                normalized = shifted / scale
-
-                valid = mask & (amax > 0)
-                values = normalized[valid]
-
-                if values.numel():
-                    # Subsample to limit memory usage.
-                    if values.numel() > 100000:
-                        indices = torch.randperm(
-                            values.numel(),
-                            device=values.device,
-                        )[:100000]
-                        values = values[indices]
-
-                    distributions[
-                        ("K_" if tensor_kind == "key" else "V_")
-                        + group_name
-                    ].append(values.cpu())
+                # Separate original values into Oaken's three groups.
+                group_masks = get_group_masks(output, thresholds)
+                
+                group_names = ["outer", "middle", "inner"]
+                
+                for group_name, mask in zip(group_names, group_masks):
+                    # Keep original values; do NOT call shift_group().
+                    selected = output * mask
+                
+                    # Calculate a separate token-wise scale for this group.
+                    amax = selected.abs().amax(dim=-1, keepdim=True)
+                    scale = (amax / 6.0).clamp(min=1e-12)
+                
+                    # Represent scale in E4M3, matching the quantizer.
+                    scale = scale.to(torch.float8_e4m3fn).to(output.dtype)
+                
+                    # Normalize the original, unshifted values.
+                    normalized = selected / scale.clamp(min=1e-12)
+                
+                    # Collect only values belonging to this group.
+                    valid = mask.bool() & (amax > 0)
+                    values = normalized[valid]
+                
+                    if values.numel() > 0:
+                        values = values.detach().float().cpu()
+                
+                        # Limit samples to keep memory usage manageable.
+                        if values.numel() > 100000:
+                            indices = torch.randperm(values.numel())[:100000]
+                            values = values[indices]
+                
+                        distributions[kind][group_name].append(values)
 
             return output
 
