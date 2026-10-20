@@ -814,7 +814,7 @@ def profile_codebooks(
 # MAIN
 # ================================================================
 def convert_codebooks_to_q3_2(codebooks):
-    scale = 4
+    scale = 2
     fixed_codebooks = {}
 
     for name, levels in codebooks.items():
