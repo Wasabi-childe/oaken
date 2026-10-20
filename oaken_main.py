@@ -1,88 +1,210 @@
-
 from functools import partial
 import json
 from statistics import mean
 
-from src.oaken.quantize import *
-import pandas as pd
+from src.oaken.quantize import MultiThresholdTokenwiseQuantizer
 
 
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
+    # ------------------------------------------------------------
+    # Load calibrated thresholds and learned codebooks
+    # ------------------------------------------------------------
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
 
     n_quant_group = quantizer_stat["n_quant_group"]
     n_layer = len(model.get_decoder().layers)
 
+    if n_quant_group != 3:
+        raise ValueError(
+            "Expected three groups: outer, middle, and inner."
+        )
+
+    if "codebooks" not in quantizer_stat:
+        raise ValueError(
+            "No learned codebooks found in the calibration file. "
+            "Run the calibration script first."
+        )
+
+    codebooks = quantizer_stat["codebooks"]
+
+    required_codebooks = [
+        "K_outer",
+        "K_middle",
+        "K_inner",
+        "V_outer",
+        "V_middle",
+        "V_inner",
+    ]
+
+    for name in required_codebooks:
+        if name not in codebooks:
+            raise ValueError("Missing codebook: " + name)
+
+    # ------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------
     sparsity_information = {
-        "key": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
-        "value": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
-        "counter": [0.0 for j in range(n_layer)]
+        "key": [
+            [0.0 for _ in range(n_quant_group)]
+            for _ in range(n_layer)
+        ],
+        "value": [
+            [0.0 for _ in range(n_quant_group)]
+            for _ in range(n_layer)
+        ],
+        "counter": [0.0 for _ in range(n_layer)],
     }
 
-    def tokenwise_quantize_activation_hook(i, module, input, output):
-        # V: 3-bit FP3-like payload + 8-bit E4M3 scale.
-        tensor = FP4E4M3Quantizer.quantize_dequantize(
-            output
+    handles = []
+
+    # ------------------------------------------------------------
+    # V projection: use V-specific learned codebooks
+    # ------------------------------------------------------------
+    def tokenwise_quantize_activation_hook(
+        i, module, inputs, output
+    ):
+        tensor, sparsity, _ = (
+            MultiThresholdTokenwiseQuantizer.downsample(
+                output,
+                quantizer_stat["value"]["lower_threshold"][i],
+                quantizer_stat["value"]["upper_threshold"][i],
+                args.quant_outlier,
+                use_group_shift=True,
+                codebooks=codebooks,
+                tensor_kind="value",
+                layer_idx=i,
+            )
         )
+
+        sparsity_information["value"][i] = [
+            a + b
+            for a, b in zip(
+                sparsity_information["value"][i],
+                sparsity,
+            )
+        ]
+
+        sparsity_information["counter"][i] += 0.5
+
         return tensor.half()
 
-    def channelwise_quantize_activation_hook(i, module, input, output):
-        # K: retain Oaken thresholds, group shifting, and INT5 paths.
-        # The INT4 path inside downsample() is replaced by FP4 + E4M3.
-        tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
-            output,
-            quantizer_stat["key"]["lower_threshold"][i],
-            quantizer_stat["key"]["upper_threshold"][i],
-            args.quant_outlier,
-            use_group_shift=True,
+    # ------------------------------------------------------------
+    # K projection: use K-specific learned codebooks
+    # ------------------------------------------------------------
+    def channelwise_quantize_activation_hook(
+        i, module, inputs, output
+    ):
+        tensor, sparsity, _ = (
+            MultiThresholdTokenwiseQuantizer.downsample(
+                output,
+                quantizer_stat["key"]["lower_threshold"][i],
+                quantizer_stat["key"]["upper_threshold"][i],
+                args.quant_outlier,
+                use_group_shift=True,
+                codebooks=codebooks,
+                tensor_kind="key",
+                layer_idx=i,
+            )
         )
 
         sparsity_information["key"][i] = [
-            sum(x) for x in zip(sparsity_information["key"][i], sparsity)
+            a + b
+            for a, b in zip(
+                sparsity_information["key"][i],
+                sparsity,
+            )
         ]
-        sparsity_information["counter"][i] += 1.0
+
+        sparsity_information["counter"][i] += 0.5
 
         return tensor.half()
 
+    # ------------------------------------------------------------
+    # Register hooks
+    # ------------------------------------------------------------
     for i, decoder in enumerate(model.get_decoder().layers):
-        decoder.self_attn.v_proj.register_forward_hook(
-            partial(tokenwise_quantize_activation_hook, i)
-        )
-        decoder.self_attn.k_proj.register_forward_hook(
-            partial(channelwise_quantize_activation_hook, i)
+        handles.append(
+            decoder.self_attn.v_proj.register_forward_hook(
+                partial(tokenwise_quantize_activation_hook, i)
+            )
         )
 
-    runner(args, model, tokenizer, device)
+        handles.append(
+            decoder.self_attn.k_proj.register_forward_hook(
+                partial(channelwise_quantize_activation_hook, i)
+            )
+        )
 
+    # ------------------------------------------------------------
+    # Run evaluation and remove hooks afterwards
+    # ------------------------------------------------------------
+    try:
+        runner(args, model, tokenizer, device)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # ------------------------------------------------------------
+    # Report per-layer and overall group fractions
+    # ------------------------------------------------------------
     key_sparsity = []
+    value_sparsity = []
+
     key_sparsity_sum = [0.0 for _ in range(n_quant_group)]
+    value_sparsity_sum = [0.0 for _ in range(n_quant_group)]
 
     for i in range(n_layer):
-        if sparsity_information["counter"][i] > 0:
-            layer_key_sparsity = [
-                x / sparsity_information["counter"][i]
-                for x in sparsity_information["key"][i]
-            ]
-        else:
-            layer_key_sparsity = [0.0 for _ in range(n_quant_group)]
+        count = sparsity_information["counter"][i]
 
-        key_sparsity.append(layer_key_sparsity)
+        if count == 0:
+            print(
+                "Warning: no K/V projection activations captured "
+                "for decoder", i
+            )
+            continue
+
+        key_layer = [
+            x / count
+            for x in sparsity_information["key"][i]
+        ]
+
+        value_layer = [
+            x / count
+            for x in sparsity_information["value"][i]
+        ]
+
+        key_sparsity.append(key_layer)
+        value_sparsity.append(value_layer)
 
         print(
-            f"Decoder {i} Sparsity: "
-            f"Key - {key_sparsity[i]}, Value - plain FP4 + E4M3"
+            "Decoder", i,
+            "Sparsity: Key -", key_layer,
+            "Value -", value_layer,
         )
 
-        for idx, item in enumerate(key_sparsity[i]):
-            key_sparsity_sum[idx] += item
+        for idx in range(n_quant_group):
+            key_sparsity_sum[idx] += key_layer[idx]
+            value_sparsity_sum[idx] += value_layer[idx]
 
-    print(
-        "Total Sparsity: "
-        f"Key - {[x / n_layer for x in key_sparsity_sum]}, "
-        "Value - not applicable (plain FP4 + E4M3)"
+    n_valid_layers = len(key_sparsity)
+
+    if n_valid_layers:
+        print(
+            "Total Sparsity: Key -",
+            [x / n_valid_layers for x in key_sparsity_sum],
+            "Value -",
+            [x / n_valid_layers for x in value_sparsity_sum],
+        )
+
+
+def key_channelwise_value_tokenwise_main(
+    args, model, tokenizer, device, runner
+):
+    # Both K and V use the same learned, multi-group quantizer.
+    return multi_group_oaken_main(
+        args, model, tokenizer, device, runner
     )
-
 
 def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner):
     sparsity_information = {
