@@ -831,6 +831,7 @@ def multi_key_value_tokenwise_main(args, runner):
         tokenizer,
         torch_device,
         runner,
+        quantizer_stat,
     )
 
     # Keep the original threshold JSON structure and add codebooks.
