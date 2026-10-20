@@ -12,7 +12,6 @@ from eval_workload import run_model
 import matplotlib.pyplot as plt
 import torch
 
-
 def plot_shifted_normalized_distributions(
     model,
     tokenizer,
@@ -23,6 +22,7 @@ def plot_shifted_normalized_distributions(
     output_dir="quantizer/oaken/group_distributions",
 ):
     import os
+
     os.makedirs(output_dir, exist_ok=True)
 
     distributions = {
@@ -34,11 +34,16 @@ def plot_shifted_normalized_distributions(
         "V_inner": [],
     }
 
+    # Limit total stored samples per group across all layers and batches.
+    max_samples_per_group = 100000
+    sample_counts = {key: 0 for key in distributions}
     handles = []
 
     def make_hook(layer_idx, tensor_kind):
         def hook(module, inputs, output):
-            x = output.detach().float()
+            rows = output.detach().float().reshape(
+                -1, output.shape[-1]
+            )
 
             lower = quantizer_stat[tensor_kind][
                 "lower_threshold"
@@ -48,54 +53,57 @@ def plot_shifted_normalized_distributions(
                 "upper_threshold"
             ][layer_idx]
 
-            rows = x.reshape(-1, x.shape[-1])
-
             masks = get_group_masks(rows, lower, upper)
+            group_names = ["outer", "middle", "inner"]
+            prefix = "K_" if tensor_kind == "key" else "V_"
 
-            for group_idx, mask in enumerate(masks):
-                if group_idx == 0:
-                    group_name = "outer"
-                elif group_idx == len(masks) - 1:
-                    group_name = "inner"
-                else:
-                    group_name = "middle"
+            for group_name, mask in zip(group_names, masks):
+                key = prefix + group_name
 
-                # Separate original values into Oaken's three groups.
-                masks = get_group_masks(rows, lower, upper)
-                group_names = ["outer", "middle", "inner"]
-                
-                for group_name, mask in zip(group_names, masks):
-                    # Keep original values; do NOT call shift_group().
-                    selected = output * mask
-                
-                    # Calculate a separate token-wise scale for this group.
-                    amax = selected.abs().amax(dim=-1, keepdim=True)
-                    scale = (amax / 6.0).clamp(min=1e-12)
-                
-                    # Represent scale in E4M3, matching the quantizer.
-                    scale = scale.to(torch.float8_e4m3fn).to(output.dtype)
-                
-                    # Normalize the original, unshifted values.
-                    normalized = selected / scale.clamp(min=1e-12)
-                
-                    # Collect only values belonging to this group.
-                    valid = mask.bool() & (amax > 0)
-                    values = normalized[valid]
-                
-                    if values.numel() > 0:
-                        values = values.detach().float().cpu()
-                
-                        # Limit samples to keep memory usage manageable.
-                        if values.numel() > 100000:
-                            indices = torch.randperm(values.numel())[:100000]
-                            values = values[indices]
-                
-                        distributions[kind][group_name].append(values)
+                remaining = (
+                    max_samples_per_group - sample_counts[key]
+                )
+
+                if remaining <= 0:
+                    continue
+
+                # Select original values in this group.
+                # No call to shift_group() is made.
+                selected = rows * mask
+
+                # Calculate one scale per token for this group.
+                scale, amax = tokenwise_e4m3_scale(
+                    selected, mask
+                )
+
+                # Normalize the original, unshifted values.
+                normalized = selected / scale.clamp(min=1e-12)
+
+                valid = mask & (amax > 0)
+                values = normalized[valid]
+
+                if values.numel() == 0:
+                    continue
+
+                # Keep only the remaining sample budget.
+                values = values.detach().float()
+
+                if values.numel() > remaining:
+                    indices = torch.randperm(
+                        values.numel(),
+                        device=values.device,
+                    )[:remaining]
+                    values = values[indices]
+
+                values = values.cpu()
+                distributions[key].append(values)
+                sample_counts[key] += values.numel()
 
             return output
 
         return hook
 
+    # Register hooks on all K and V projection layers.
     for layer_idx, decoder in enumerate(
         model.get_decoder().layers
     ):
@@ -111,12 +119,15 @@ def plot_shifted_normalized_distributions(
         )
 
     try:
+        print(
+            "\nCollecting unshifted, group-normalized K/V distributions..."
+        )
         runner(args, model, tokenizer, torch_device)
     finally:
         for handle in handles:
             handle.remove()
 
-    # One histogram per group, with K and V plotted separately.
+    # Plot three groups separately for K and V.
     for tensor_name in ("K", "V"):
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
@@ -142,24 +153,33 @@ def plot_shifted_normalized_distributions(
             ax.set_title(
                 tensor_name + " " + group_name
             )
-            ax.set_xlabel("Shifted value / E4M3 scale")
+            ax.set_xlabel("Original group value / E4M3 scale")
             ax.set_ylabel("Density")
             ax.grid(True, alpha=0.3)
 
+            print(
+                key,
+                "| samples =", len(values),
+                "| min =", float(values.min()),
+                "| max =", float(values.max()),
+            )
+
         fig.suptitle(
-            tensor_name + " distributions after group shift and scaling"
+            tensor_name
+            + " distributions before group shifting"
         )
         fig.tight_layout()
 
         path = os.path.join(
             output_dir,
-            tensor_name + "_shifted_normalized.png",
+            tensor_name + "_unshifted_normalized.png",
         )
         fig.savefig(path, dpi=200)
         plt.show()
         plt.close(fig)
 
         print("Saved:", path)
+
 # ================================================================
 # CONFIGURATION
 # ================================================================
