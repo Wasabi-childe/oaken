@@ -559,7 +559,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 levels_int = codebooks[class_name]
                 
                 levels = [
-                    value / 4.0
+                    value / 2.0
                     for value in levels_int
                 ]
                 
