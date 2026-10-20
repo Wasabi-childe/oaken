@@ -64,7 +64,7 @@ def plot_shifted_normalized_distributions(
                 masks = get_group_masks(rows, lower, upper)
                 group_names = ["outer", "middle", "inner"]
                 
-                for group_name, mask in zip(group_names, group_masks):
+                for group_name, mask in zip(group_names, masks):
                     # Keep original values; do NOT call shift_group().
                     selected = output * mask
                 
