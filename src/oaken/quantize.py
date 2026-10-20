@@ -1,70 +1,56 @@
 
 import torch
+import torch.nn.functional as F
 from typing import Optional
 
 
-import torch
-import torch.nn.functional as F
+# ================================================================
+# FIXED FP4 E2M1
+# ================================================================
 
 def _e2m1_round_magnitude(m):
-    levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                          device=m.device, dtype=m.dtype)
-    idx = ((m > 0.25).long() + (m >= 0.75).long() + (m > 1.25).long()
-           + (m >= 1.75).long() + (m > 2.5).long() + (m >= 3.5).long()
-           + (m > 5.0).long())
-    return levels[idx]
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=m.device,
+        dtype=m.dtype,
+    )
+
+    idx = (
+        (m > 0.25).long()
+        + (m >= 0.75).long()
+        + (m > 1.25).long()
+        + (m >= 1.75).long()
+        + (m > 2.5).long()
+        + (m >= 3.5).long()
+        + (m > 5.0).long()
+    )
+
+    return levels[idx.clamp(max=len(levels) - 1)]
+
 
 class FP4Quantizer:
     @classmethod
-    def quantize_dequantize(cls, tensor: torch.Tensor) -> torch.Tensor:
+    def quantize_dequantize(cls, tensor: torch.Tensor):
         if tensor.numel() == 0:
             return tensor.clone()
 
-        shape = tensor.shape
-        dtype = tensor.dtype
-
         x = tensor.float()
+        magnitude = _e2m1_round_magnitude(
+            x.abs().clamp(max=6.0)
+        )
 
-        # No scaling: quantize directly to the E2M1 FP4 codebook.
-        mag = _e2m1_round_magnitude(x.abs().clamp(max=6.0))
-        out = torch.copysign(mag, x)
-
-        return out.reshape(shape).to(dtype)
-
-
+        return torch.copysign(
+            magnitude, x
+        ).reshape(tensor.shape).to(tensor.dtype)
 
 
 class FP4E4M3Quantizer:
-
     @staticmethod
     def quantize_dequantize(
-        tensor,
-        scale_mode="token",
-        group_size=32
+        tensor: torch.Tensor,
+        scale_mode: str = "token",
+        group_size: int = 32,
     ):
-        """
-        FP4 E2M1 quantization with E4M3 scales.
-
-        Parameters
-        ----------
-        tensor:
-            Input tensor. The last dimension is the feature dimension.
-
-        scale_mode:
-            "token": one scale for the complete last dimension
-                     of each token.
-
-            "group": one scale per group along the last dimension.
-
-        group_size:
-            Number of values covered by each scale in group mode.
-            Ignored in token mode.
-
-        Returns
-        -------
-        Dequantized tensor in the original shape and dtype.
-        """
-
         if scale_mode not in ("token", "group"):
             raise ValueError(
                 "scale_mode must be 'token' or 'group'"
@@ -74,119 +60,73 @@ class FP4E4M3Quantizer:
             return tensor.clone()
 
         if scale_mode == "group" and group_size <= 0:
-            raise ValueError(
-                "group_size must be greater than zero"
-            )
+            raise ValueError("group_size must be positive")
 
         original_shape = tensor.shape
         original_dtype = tensor.dtype
         last_dim = original_shape[-1]
 
-        # Work in FP32 for the quantization calculations.
-        x = tensor.float()
-
-        # Flatten all leading dimensions into rows.
-        # For [batch, sequence, hidden], each row represents a token.
-        x = x.reshape(-1, last_dim)
+        x = tensor.float().reshape(-1, last_dim)
 
         if scale_mode == "token":
+            amax = x.abs().amax(dim=-1, keepdim=True)
 
-            # One scale for the entire feature vector of each token.
-            amax = x.abs().amax(
-                dim=-1,
-                keepdim=True
-            )
-
-            scale = amax / 6.0
-
-            # Handle all-zero vectors safely.
             scale = torch.where(
                 amax > 0,
-                scale,
-                torch.ones_like(scale)
+                amax / 6.0,
+                torch.ones_like(amax),
             )
 
-            # Store scales in E4M3, then use their represented values.
-            scale = scale.to(
-                torch.float8_e4m3fn
-            ).float()
-
+            scale = scale.to(torch.float8_e4m3fn).float()
             scale = scale.clamp_min(1e-8)
 
-            normalized = x / scale
-
-            normalized = normalized.clamp(-6.0, 6.0)
+            normalized = (x / scale).clamp(-6.0, 6.0)
 
             magnitude = _e2m1_round_magnitude(
                 normalized.abs()
             )
 
-            quantized = normalized.sign() * magnitude
-
-            reconstructed = quantized * scale
+            reconstructed = normalized.sign() * magnitude * scale
 
         else:
-
-            # Pad the feature dimension to complete the last group.
             padding = (
                 group_size - last_dim % group_size
             ) % group_size
 
             if padding:
-                x = torch.nn.functional.pad(
-                    x,
-                    (0, padding)
-                )
+                x = F.pad(x, (0, padding))
 
             padded_dim = x.shape[-1]
-            n_groups = padded_dim // group_size
 
-            # [rows, groups, values_per_group]
             grouped = x.reshape(
                 x.shape[0],
-                n_groups,
-                group_size
+                padded_dim // group_size,
+                group_size,
             )
 
-            # One scale per group.
             amax = grouped.abs().amax(
-                dim=-1,
-                keepdim=True
+                dim=-1, keepdim=True
             )
-
-            scale = amax / 6.0
 
             scale = torch.where(
                 amax > 0,
-                scale,
-                torch.ones_like(scale)
+                amax / 6.0,
+                torch.ones_like(amax),
             )
 
-            scale = scale.to(
-                torch.float8_e4m3fn
-            ).float()
-
+            scale = scale.to(torch.float8_e4m3fn).float()
             scale = scale.clamp_min(1e-8)
 
-            normalized = grouped / scale
-
-            normalized = normalized.clamp(-6.0, 6.0)
+            normalized = (grouped / scale).clamp(-6.0, 6.0)
 
             magnitude = _e2m1_round_magnitude(
                 normalized.abs()
             )
 
-            quantized = normalized.sign() * magnitude
+            reconstructed = (
+                normalized.sign() * magnitude * scale
+            ).reshape(x.shape[0], padded_dim)
 
-            reconstructed = quantized * scale
-
-            # Restore the padded groups to a flat feature dimension.
-            reconstructed = reconstructed.reshape(
-                x.shape[0],
-                padded_dim
-            )
-
-            # Remove padding.
             reconstructed = reconstructed[:, :last_dim]
 
         return reconstructed.reshape(
@@ -194,6 +134,159 @@ class FP4E4M3Quantizer:
         ).to(original_dtype)
 
 
+# ================================================================
+# FIXED FP5-LIKE FORMAT
+#
+# This is a software-defined format:
+# sign + 16 magnitude levels + token-wise E4M3 scale.
+# It is not a standard IEEE FP5 format.
+# ================================================================
+
+class FP5E4M3Quantizer:
+    @staticmethod
+    def quantize_dequantize(tensor: torch.Tensor):
+        if tensor.numel() == 0:
+            return tensor.clone()
+
+        original_shape = tensor.shape
+        original_dtype = tensor.dtype
+        last_dim = original_shape[-1]
+
+        x = tensor.float().reshape(-1, last_dim)
+
+        amax = x.abs().amax(dim=-1, keepdim=True)
+
+        scale = torch.where(
+            amax > 0,
+            amax / 7.0,
+            torch.ones_like(amax),
+        )
+
+        scale = scale.to(torch.float8_e4m3fn).float()
+        scale = scale.clamp_min(1e-8)
+
+        normalized = (x / scale).clamp(-7.0, 7.0)
+
+        levels = torch.tensor(
+            [
+                0.0, 0.25, 0.5, 0.75,
+                1.0, 1.25, 1.5, 1.75,
+                2.0, 2.5, 3.0, 3.5,
+                4.0, 5.0, 6.0, 7.0,
+            ],
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        edges = (levels[:-1] + levels[1:]) / 2.0
+
+        indices = torch.bucketize(
+            normalized.abs().contiguous(),
+            edges,
+        )
+
+        magnitude = levels[indices]
+
+        reconstructed = normalized.sign() * magnitude * scale
+
+        return reconstructed.reshape(
+            original_shape
+        ).to(original_dtype)
+
+
+# ================================================================
+# LEARNED CODEBOOK QUANTIZER
+#
+# levels:
+#   FP5: 16 learned magnitude levels, expected range [0, 7].
+#   FP4:  8 learned magnitude levels, expected range [0, 6].
+#
+# One E4M3 scale per token and group.
+# ================================================================
+
+class LearnedCodebookQuantizer:
+    @staticmethod
+    def quantize_dequantize(
+        tensor: torch.Tensor,
+        levels,
+        max_level: float,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        if tensor.numel() == 0:
+            return tensor.clone()
+
+        original_shape = tensor.shape
+        original_dtype = tensor.dtype
+        last_dim = original_shape[-1]
+
+        x = tensor.float().reshape(-1, last_dim)
+
+        if mask is not None:
+            selected_mask = mask.reshape(
+                -1, last_dim
+            ).bool()
+
+            x = x * selected_mask
+
+        else:
+            selected_mask = None
+
+        # Token-wise scale computed from the selected group only.
+        amax = x.abs().amax(dim=-1, keepdim=True)
+
+        scale = torch.where(
+            amax > 0,
+            amax / max_level,
+            torch.ones_like(amax),
+        )
+
+        scale = scale.to(torch.float8_e4m3fn).float()
+        scale = scale.clamp_min(1e-8)
+
+        normalized = (x / scale).abs().clamp(
+            0.0, max_level
+        )
+
+        levels = torch.as_tensor(
+            levels,
+            device=x.device,
+            dtype=x.dtype,
+        ).flatten()
+
+        if levels.numel() not in (8, 16):
+            raise ValueError(
+                "Expected 8 FP4 or 16 FP5 magnitude levels."
+            )
+
+        if not torch.all(levels[1:] >= levels[:-1]):
+            raise ValueError(
+                "Codebook levels must be sorted."
+            )
+
+        edges = (levels[:-1] + levels[1:]) / 2.0
+
+        indices = torch.bucketize(
+            normalized.contiguous(),
+            edges,
+        )
+
+        magnitude = levels[indices]
+
+        reconstructed = (
+            x.sign() * magnitude * scale
+        )
+
+        if selected_mask is not None:
+            reconstructed = reconstructed * selected_mask
+
+        return reconstructed.reshape(
+            original_shape
+        ).to(original_dtype)
+
+
+# ================================================================
+# OAKEN THRESHOLD QUANTIZER
+# ================================================================
 
 class OakenQuantizer:
     QUANTIZE_BITS = 4
@@ -205,12 +298,11 @@ class OakenQuantizer:
         cls,
         input_tensor: torch.Tensor,
         threshold_lower: float,
-        threshold_upper: float
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-        outlier_mask = torch.logical_or(
-            input_tensor <= threshold_lower,
-            threshold_upper <= input_tensor
+        threshold_upper: float,
+    ):
+        outlier_mask = (
+            (input_tensor <= threshold_lower)
+            | (input_tensor >= threshold_upper)
         )
 
         outlier = input_tensor * outlier_mask
@@ -222,63 +314,58 @@ class OakenQuantizer:
     def get_multigroup_threshold(
         cls,
         input_tensor: torch.Tensor,
-        threshold_lowers: list[float],
-        threshold_uppers: list[float]
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        threshold_lowers: list,
+        threshold_uppers: list,
+    ):
+        if len(threshold_lowers) != len(threshold_uppers):
+            raise ValueError(
+                "Threshold lower/upper lists must have equal lengths"
+            )
 
-        group_masks = list()
-        group_tensors = list()
-        prev_thr_low, prev_thr_up = None, None
+        if len(threshold_lowers) < 2:
+            raise ValueError(
+                "At least two threshold groups are required"
+            )
+
+        group_masks = []
+        group_tensors = []
+
+        prev_thr_low = None
+        prev_thr_up = None
 
         for idx, (thr_low, thr_up) in enumerate(
             zip(threshold_lowers, threshold_uppers)
         ):
             if idx == len(threshold_lowers) - 1:
-                # Inner-most Group
-                group_masks.append(
-                    mask := torch.logical_and(
-                        input_tensor > prev_thr_low,
-                        input_tensor < prev_thr_up
-                    )
+                mask = (
+                    (input_tensor > prev_thr_low)
+                    & (input_tensor < prev_thr_up)
                 )
 
-            elif (
-                prev_thr_low is not None
-                and prev_thr_up is not None
-            ):
-                group_masks.append(
-                    mask := torch.logical_or(
-                        torch.logical_and(
-                            prev_thr_low < input_tensor,
-                            input_tensor <= thr_low
-                        ),
-                        torch.logical_and(
-                            thr_up <= input_tensor,
-                            input_tensor < prev_thr_up
-                        )
+            elif prev_thr_low is not None:
+                mask = (
+                    (
+                        (input_tensor > prev_thr_low)
+                        & (input_tensor <= thr_low)
+                    )
+                    |
+                    (
+                        (input_tensor >= thr_up)
+                        & (input_tensor < prev_thr_up)
                     )
                 )
 
             else:
-                # Outer-most Group
-                group_masks.append(
-                    mask := torch.logical_or(
-                        input_tensor <= thr_low,
-                        thr_up <= input_tensor
-                    )
+                mask = (
+                    (input_tensor <= thr_low)
+                    | (input_tensor >= thr_up)
                 )
+
+            group_masks.append(mask)
+            group_tensors.append(input_tensor * mask)
 
             prev_thr_low = thr_low
             prev_thr_up = thr_up
-
-            group_tensors.append(input_tensor * mask)
-
-        assert (
-            len(threshold_lowers)
-            == len(threshold_uppers)
-            == len(group_tensors)
-            == len(group_masks)
-        )
 
         return group_tensors, group_masks
 
@@ -286,17 +373,28 @@ class OakenQuantizer:
     def uniform_quantization_threshold(
         tensor,
         bits: int,
-        minval: torch.Tensor,
-        maxval: torch.Tensor
+        minval,
+        maxval,
     ):
         rangeval = maxval - minval
-        qx = (2 ** bits - 1) / rangeval
+
+        if torch.is_tensor(rangeval):
+            safe_range = torch.where(
+                rangeval == 0,
+                torch.ones_like(rangeval),
+                rangeval,
+            )
+        else:
+            safe_range = rangeval if rangeval != 0 else 1.0
+
+        qx = (2 ** bits - 1) / safe_range
         offset = minval * qx
 
         quantized = torch.round(qx * tensor - offset)
+
         quantized = torch.nan_to_num(
             quantized,
-            nan=2 ** bits - 1
+            nan=2 ** bits - 1,
         )
 
         return (quantized + offset) / qx
@@ -317,6 +415,17 @@ class OakenQuantizer:
         return truncated.view(torch.float16)
 
 
+# ================================================================
+# MULTI-GROUP TOKEN-WISE QUANTIZER
+#
+# With three groups:
+#   outer  -> FP5
+#   middle -> FP4
+#   inner  -> FP5
+#
+# Supply codebooks=None for fixed codebooks.
+# Supply the learned codebooks dictionary to use learned levels.
+# ================================================================
 
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
@@ -324,100 +433,175 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     def downsample(
         cls,
         input_tensor: torch.Tensor,
-        threshold_lowers: list[float],
-        threshold_uppers: list[float],
-        quantize_outlier: bool = False,
-        use_group_shift: bool = True
-    ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
+        threshold_lowers: list,
+        threshold_uppers: list,
+        quantize_outlier: bool = True,
+        use_group_shift: bool = True,
+        codebooks: Optional[dict] = None,
+        tensor_kind: Optional[str] = None,
+        layer_idx: Optional[int] = None,
+    ):
+        if len(threshold_lowers) != 3:
+            raise ValueError(
+                "This six-codebook configuration expects "
+                "three groups: outer, middle, inner."
+            )
+
+        if len(threshold_uppers) != 3:
+            raise ValueError(
+                "Expected three upper thresholds."
+            )
+
+        if codebooks is not None:
+            if tensor_kind not in ("key", "value"):
+                raise ValueError(
+                    "tensor_kind must be 'key' or 'value' "
+                    "when learned codebooks are supplied."
+                )
 
         grouped_tensors, masks = cls.get_multigroup_threshold(
             input_tensor,
             threshold_lowers,
-            threshold_uppers
+            threshold_uppers,
         )
 
-        result_tensor = torch.zeros_like(input_tensor).to(
-            input_tensor.device
+        result_tensor = torch.zeros_like(
+            input_tensor
         ).half()
 
-        if quantize_outlier:
-
-            # Quantize the inner-most group using FP4 + E4M3.
-            grouped_tensors[-1] = (
+        # Preserve the original non-outlier-quantization mode.
+        if not quantize_outlier and codebooks is None:
+            grouped_tensors[-2] = (
                 FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-1]
+                    grouped_tensors[-2],
+                    scale_mode="token",
                 )
             )
 
-            # Quantize the outer groups using FP4 + E4M3.
-            for idx in range(len(threshold_lowers) - 1):
+            for group, mask in zip(grouped_tensors, masks):
+                result_tensor += (
+                    group * mask
+                ).to(result_tensor.dtype)
 
-                threshold_lower_tensor = torch.tensor(
+            val_frac = [
+                (
+                    torch.count_nonzero(mask) / mask.numel()
+                ).item()
+                for mask in masks
+            ]
+
+            return result_tensor, val_frac, None
+
+        for idx, (group, mask) in enumerate(
+            zip(grouped_tensors, masks)
+        ):
+            if idx == 0:
+                group_name = "outer"
+            elif idx == 1:
+                group_name = "middle"
+            else:
+                group_name = "inner"
+
+            # Middle uses FP4; outer and inner use FP5.
+            if group_name == "middle":
+                bits = 4
+                max_level = 6.0
+            else:
+                bits = 5
+                max_level = 7.0
+
+            positive_mask = mask & (input_tensor > 0)
+            negative_mask = mask & (input_tensor < 0)
+
+            shifted = input_tensor * mask
+
+            # Match the supplied Oaken group-shifting behavior:
+            # outer and middle shift; inner does not.
+            if use_group_shift and group_name != "inner":
+                low = torch.as_tensor(
                     threshold_lowers[idx],
-                    device=input_tensor.device
-                ).half()
+                    device=input_tensor.device,
+                    dtype=input_tensor.dtype,
+                )
 
-                threshold_upper_tensor = torch.tensor(
+                high = torch.as_tensor(
                     threshold_uppers[idx],
-                    device=input_tensor.device
-                ).half()
-
-                higher_mask = grouped_tensors[idx] > 0
-                lower_mask = grouped_tensors[idx] < 0
-
-                higher_outlier = (
-                    grouped_tensors[idx] * higher_mask
-                )
-                lower_outlier = (
-                    grouped_tensors[idx] * lower_mask
+                    device=input_tensor.device,
+                    dtype=input_tensor.dtype,
                 )
 
-                # Preserve the original group-shifting behavior.
-                if use_group_shift:
-                    higher_outlier -= threshold_upper_tensor
-                    lower_outlier -= threshold_lower_tensor
+                shifted = torch.where(
+                    positive_mask,
+                    input_tensor - high,
+                    shifted,
+                )
 
-                # FP4 + E4M3 replaces INT5 for all outlier groups.
-                total_outlier = (
-                    FP4E4M3Quantizer.quantize_dequantize(
-                        higher_outlier * higher_mask
-                        + lower_outlier * lower_mask
+                shifted = torch.where(
+                    negative_mask,
+                    input_tensor - low,
+                    shifted,
+                )
+
+                shifted = shifted * mask
+
+            if codebooks is not None:
+                class_name = (
+                    ("K_" if tensor_kind == "key" else "V_")
+                    + group_name
+                )
+
+                if class_name not in codebooks:
+                    raise KeyError(
+                        "Missing codebook: " + class_name
+                    )
+
+                levels = codebooks[class_name]
+
+                quantized = (
+                    LearnedCodebookQuantizer.quantize_dequantize(
+                        shifted,
+                        levels=levels,
+                        max_level=max_level,
+                        mask=mask,
                     )
                 )
 
-                higher_outlier = total_outlier * higher_mask
-                lower_outlier = total_outlier * lower_mask
-
-                # Restore the original threshold offsets.
-                if use_group_shift:
-                    higher_outlier += threshold_upper_tensor
-                    lower_outlier += threshold_lower_tensor
-
-                grouped_tensors[idx] = (
-                    higher_outlier * higher_mask
-                    + lower_outlier * lower_mask
+            elif bits == 4:
+                quantized = FP4E4M3Quantizer.quantize_dequantize(
+                    shifted,
+                    scale_mode="token",
                 )
 
-        else:
-
-            # Quantize the middle group using FP4 + E4M3.
-            grouped_tensors[-2] = (
-                FP4E4M3Quantizer.quantize_dequantize(
-                    grouped_tensors[-2]
+            else:
+                quantized = FP5E4M3Quantizer.quantize_dequantize(
+                    shifted,
                 )
+
+            # Restore group offsets after quantization.
+            if use_group_shift and group_name != "inner":
+                quantized = torch.where(
+                    positive_mask,
+                    quantized + high,
+                    quantized,
+                )
+
+                quantized = torch.where(
+                    negative_mask,
+                    quantized + low,
+                    quantized,
+                )
+
+            quantized = quantized * mask
+
+            result_tensor += quantized.to(
+                result_tensor.dtype
             )
-
-        # Reconstruct the result using the original group masks.
-        for tensor, mask in zip(grouped_tensors, masks):
-            result_tensor += tensor * mask
-
-        heat_map = None
 
         val_frac = [
             (
-                torch.count_nonzero(mask) / torch.numel(mask)
+                torch.count_nonzero(mask) / mask.numel()
             ).item()
             for mask in masks
         ]
 
-        return result_tensor, val_frac, heat_map
+        return result_tensor, val_frac, None
