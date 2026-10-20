@@ -656,6 +656,7 @@ def multi_key_value_tokenwise_main(args, runner):
     start_time = time.monotonic()
 
     # Pass 1: determine Oaken's threshold boundaries.
+# Pass 1: determine Oaken's threshold boundaries.
     quantizer_stat = profile_thresholds(
         args,
         model,
@@ -663,7 +664,17 @@ def multi_key_value_tokenwise_main(args, runner):
         torch_device,
         runner,
     )
-
+    
+    # Plot K/V distributions after group shifting and scale division.
+    plot_shifted_normalized_distributions(
+        model,
+        tokenizer,
+        args,
+        torch_device,
+        runner,
+        quantizer_stat,
+    )
+    
     # Pass 2: collect normalized group values and fit codebooks.
     codebooks, histogram_counts = profile_codebooks(
         args,
@@ -671,7 +682,6 @@ def multi_key_value_tokenwise_main(args, runner):
         tokenizer,
         torch_device,
         runner,
-        quantizer_stat,
     )
 
     # Keep the original threshold JSON structure and add codebooks.
