@@ -899,8 +899,8 @@ def multi_key_value_tokenwise_main(args, runner):
     
     quantizer_stat["codebooks_q3_2"] = fixed_codebooks
     quantizer_stat["codebook_metadata"]["fixed_point_format"] = "Q3.2"
-    quantizer_stat["codebook_metadata"]["fixed_point_scale"] = 4
-    quantizer_stat["codebook_metadata"]["fixed_point_decode"] = "value = integer / 4"
+    quantizer_stat["codebook_metadata"]["fixed_point_scale"] = 2
+    quantizer_stat["codebook_metadata"]["fixed_point_decode"] = "value = integer / 2"
 
     with open(args.output_file, "w") as file:
         json.dump(quantizer_stat, file, indent=2)
