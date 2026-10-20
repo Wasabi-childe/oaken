@@ -69,15 +69,23 @@ def plot_shifted_normalized_distributions(
 
                 # Select original values in this group.
                 # No call to shift_group() is made.
-                selected = rows * mask
-
-                # Calculate one scale per token for this group.
-                scale, amax = tokenwise_e4m3_scale(
-                    selected, mask
-                )
-
-                # Normalize the original, unshifted values.
-                normalized = selected / scale.clamp(min=1e-12)
+# Select raw original activation values for this group.
+                selected = rows[mask]
+                
+                if selected.numel() > 0:
+                    print(
+                        prefix + group_name,
+                        "| raw values:",
+                        selected[:30].detach().cpu().tolist()
+                    )
+                
+                # Calculate scale and normalize, for plotting only.
+                masked_rows = rows * mask
+                scale, amax = tokenwise_e4m3_scale(masked_rows, mask)
+                normalized = masked_rows / scale.clamp(min=1e-12)
+                
+                valid = mask & (amax > 0)
+                values = normalized[valid]
 
                 valid = mask & (amax > 0)
                 values = normalized[valid]
