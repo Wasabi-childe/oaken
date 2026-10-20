@@ -555,8 +555,14 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                         "Missing codebook: " + class_name
                     )
 
-                levels = codebooks[class_name]
-
+                # Load Q3.2 integer entries and reconstruct their float values.
+                levels_int = codebooks[class_name]
+                
+                levels = [
+                    value / 4.0
+                    for value in levels_int
+                ]
+                
                 quantized = (
                     LearnedCodebookQuantizer.quantize_dequantize(
                         shifted,
