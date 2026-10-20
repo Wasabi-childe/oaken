@@ -788,3 +788,155 @@ if __name__ == "__main__":
         args,
         selected_runner,
     )
+
+
+import matplotlib.pyplot as plt
+import torch
+
+
+def plot_shifted_normalized_distributions(
+    model,
+    tokenizer,
+    args,
+    torch_device,
+    runner,
+    quantizer_stat,
+    output_dir="quantizer/oaken/group_distributions",
+):
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    distributions = {
+        "K_outer": [],
+        "K_middle": [],
+        "K_inner": [],
+        "V_outer": [],
+        "V_middle": [],
+        "V_inner": [],
+    }
+
+    handles = []
+
+    def make_hook(layer_idx, tensor_kind):
+        def hook(module, inputs, output):
+            x = output.detach().float()
+
+            lower = quantizer_stat[tensor_kind][
+                "lower_threshold"
+            ][layer_idx]
+
+            upper = quantizer_stat[tensor_kind][
+                "upper_threshold"
+            ][layer_idx]
+
+            rows = x.reshape(-1, x.shape[-1])
+
+            masks = get_group_masks(rows, lower, upper)
+
+            for group_idx, mask in enumerate(masks):
+                if group_idx == 0:
+                    group_name = "outer"
+                elif group_idx == len(masks) - 1:
+                    group_name = "inner"
+                else:
+                    group_name = "middle"
+
+                shifted = shift_group(
+                    rows,
+                    mask,
+                    group_idx,
+                    lower,
+                    upper,
+                )
+
+                scale, amax = tokenwise_e4m3_scale(
+                    shifted, mask
+                )
+
+                normalized = shifted / scale
+
+                valid = mask & (amax > 0)
+                values = normalized[valid]
+
+                if values.numel():
+                    # Subsample to limit memory usage.
+                    if values.numel() > 100000:
+                        indices = torch.randperm(
+                            values.numel(),
+                            device=values.device,
+                        )[:100000]
+                        values = values[indices]
+
+                    distributions[
+                        ("K_" if tensor_kind == "key" else "V_")
+                        + group_name
+                    ].append(values.cpu())
+
+            return output
+
+        return hook
+
+    for layer_idx, decoder in enumerate(
+        model.get_decoder().layers
+    ):
+        handles.append(
+            decoder.self_attn.k_proj.register_forward_hook(
+                make_hook(layer_idx, "key")
+            )
+        )
+        handles.append(
+            decoder.self_attn.v_proj.register_forward_hook(
+                make_hook(layer_idx, "value")
+            )
+        )
+
+    try:
+        runner(args, model, tokenizer, torch_device)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # One histogram per group, with K and V plotted separately.
+    for tensor_name in ("K", "V"):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+        for ax, group_name in zip(
+            axes, ("outer", "middle", "inner")
+        ):
+            key = tensor_name + "_" + group_name
+            chunks = distributions[key]
+
+            if not chunks:
+                ax.set_title(group_name + " (no samples)")
+                continue
+
+            values = torch.cat(chunks).numpy()
+
+            ax.hist(
+                values,
+                bins=200,
+                range=(-7, 7),
+                density=True,
+            )
+
+            ax.set_title(
+                tensor_name + " " + group_name
+            )
+            ax.set_xlabel("Shifted value / E4M3 scale")
+            ax.set_ylabel("Density")
+            ax.grid(True, alpha=0.3)
+
+        fig.suptitle(
+            tensor_name + " distributions after group shift and scaling"
+        )
+        fig.tight_layout()
+
+        path = os.path.join(
+            output_dir,
+            tensor_name + "_shifted_normalized.png",
+        )
+        fig.savefig(path, dpi=200)
+        plt.show()
+        plt.close(fig)
+
+        print("Saved:", path)
