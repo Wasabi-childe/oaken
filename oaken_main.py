@@ -26,7 +26,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             "Run the calibration script first."
         )
 
-    codebooks = quantizer_stat["codebooks"]
+    codebooks = quantizer_stat["codebooks_q3_2"]
 
     required_codebooks = [
         "K_outer",
