@@ -8,7 +8,7 @@ import pandas as pd
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
-        n_quant_group = quantizer_stat["n_quant_group"]
+        n_quant_group = 1
         n_layer = len(model.get_decoder().layers)
 
         sparsity_information = {
