@@ -813,7 +813,17 @@ def profile_codebooks(
 # ================================================================
 # MAIN
 # ================================================================
+def convert_codebooks_to_q3_2(codebooks):
+    scale = 4
+    fixed_codebooks = {}
 
+    for name, levels in codebooks.items():
+        fixed_codebooks[name] = [
+            int(round(value * scale))
+            for value in levels
+        ]
+
+    return fixed_codebooks
 def multi_key_value_tokenwise_main(args, runner):
     if len(args.list_fracs) != 3:
         raise ValueError(
@@ -862,6 +872,7 @@ def multi_key_value_tokenwise_main(args, runner):
         runner,
         quantizer_stat,
     )
+    
 
     # Keep the original threshold JSON structure and add codebooks.
     quantizer_stat["codebook_config"] = CODEBOOK_CONFIG
@@ -882,6 +893,14 @@ def multi_key_value_tokenwise_main(args, runner):
             "It does not quantize the KV cache during evaluation."
         ),
     }
+
+    # Convert floating-point lookup values to Q3.2 integers.
+    fixed_codebooks = convert_codebooks_to_q3_2(codebooks)
+    
+    quantizer_stat["codebooks_q3_2"] = fixed_codebooks
+    quantizer_stat["codebook_metadata"]["fixed_point_format"] = "Q3.2"
+    quantizer_stat["codebook_metadata"]["fixed_point_scale"] = 4
+    quantizer_stat["codebook_metadata"]["fixed_point_decode"] = "value = integer / 4"
 
     with open(args.output_file, "w") as file:
         json.dump(quantizer_stat, file, indent=2)
