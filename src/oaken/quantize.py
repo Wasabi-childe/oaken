@@ -122,7 +122,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             if idx == len(threshold_lowers) - 2:
                 bits = cls.QUANTIZE_BITS
             else:
-                bits = cls.OUTLIER_BITS
+                bits = cls.QUANTIZE_BITS
             
             # Mean subtraction + symmetric quantization + mean restoration
             grouped_tensors[idx] = cls.mean_symmetric_quantization(
