@@ -22,7 +22,7 @@ class OakenQuantizer:
     
         # Calculate token-wise mean
         count = mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        mean = x.sum(dim=-1, keepdim=True) / count
+        mean = (x * mask).sum(dim=-1, keepdim=True) / count
     
         valid = mask.any(dim=-1, keepdim=True)
         mean = torch.where(valid, mean, torch.zeros_like(mean))
@@ -139,8 +139,6 @@ class OakenQuantizer:
         truncated = int16_tensor & 0b1_11111_1110_0000_00
         return truncated.view(torch.float16)
 
-
-
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(
@@ -159,22 +157,23 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         result_tensor = torch.zeros_like(input_tensor).half()
 
         if quantize_outlier:
-            # Quantize each group using E2M1 FP4
-            for idx, (tensor, mask) in enumerate(
-                zip(grouped_tensors, masks)
-            ):
+
+            # Quantize all threshold groups using FP4
+            for idx in range(len(grouped_tensors)):
                 grouped_tensors[idx] = cls.mean_fp4_quantization(
-                    tensor, mask
+                    grouped_tensors[idx],
+                    masks[idx]
                 )
 
         else:
-            # Quantize only the middle group using E2M1 FP4
+
+            # Quantize only the middle group using FP4
             grouped_tensors[-2] = cls.mean_fp4_quantization(
                 grouped_tensors[-2],
                 masks[-2]
             )
 
-        # Reconstruct final tensor from all groups
+        # Reconstruct final tensor
         for tensor, mask in zip(grouped_tensors, masks):
             result_tensor += tensor * mask
 
@@ -186,4 +185,3 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ]
 
         return result_tensor, val_frac, heat_map
-
