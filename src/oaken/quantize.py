@@ -14,100 +14,6 @@ class OakenQuantizer:
         inlier = input_tensor * ~outlier_mask
 
         return inlier, outlier, outlier_mask
-    @staticmethod
-    def fp4_e2m1_masked_quantization(tensor, mask):
-        x = tensor.float()
-        mask = mask.bool()
-    
-        # E2M1 FP4 representable values
-        codebook = torch.tensor(
-            [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
-              0.5,  1.0,  1.5,  2.0,  3.0,  4.0, 6.0],
-            device=x.device
-        )
-    
-        # Find maximum absolute value for each token
-        max_abs = x.abs().masked_fill(~mask, 0.0).amax(
-            dim=-1, keepdim=True
-        )
-    
-        # Scale values into the FP4 range [-6, 6]
-        scale = max_abs / 6.0
-        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    
-        normalized = x / scale
-    
-        # Find nearest E2M1 representable value
-        distances = torch.abs(
-            normalized.unsqueeze(-1) - codebook
-        )
-    
-        indices = distances.argmin(dim=-1)
-        quantized = codebook[indices]
-    
-        # Reconstruct original-scale values
-        reconstructed = quantized * scale
-    
-        return reconstructed * mask
-    @staticmethod
-    def tokenwise_masked_quantization(
-        tensor: torch.Tensor,
-        mask: torch.Tensor,
-        bits: int
-    ):
-        x = tensor.float()
-        mask = mask.bool()
-    
-        qmax = (2 ** bits) - 1
-    
-        # Find minimum and maximum valid values for each token
-        minval = x.masked_fill(~mask, float('inf')).amin(
-            dim=-1, keepdim=True
-        )
-    
-        maxval = x.masked_fill(~mask, float('-inf')).amax(
-            dim=-1, keepdim=True
-        )
-    
-        # Handle tokens with no valid values
-        valid = mask.any(dim=-1, keepdim=True)
-    
-        minval = torch.where(
-            valid, minval, torch.zeros_like(minval)
-        )
-    
-        maxval = torch.where(
-            valid, maxval, torch.zeros_like(maxval)
-        )
-    
-        # Calculate quantization range
-        rangeval = maxval - minval
-    
-        safe_range = torch.where(
-            rangeval > 0,
-            rangeval,
-            torch.ones_like(rangeval)
-        )
-    
-        # Quantize
-        quantized = torch.round(
-            (x - minval) * qmax / safe_range
-        )
-    
-        # Reconstruct
-        reconstructed = (
-            quantized * safe_range / qmax
-        ) + minval
-    
-        # Handle constant-valued groups
-        reconstructed = torch.where(
-            rangeval > 0,
-            reconstructed,
-            minval
-        )
-    
-        # Ignore invalid positions
-        return reconstructed * mask
 
     @classmethod
     def get_multigroup_threshold(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -168,35 +74,38 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
 
         grouped_tensors, masks = cls.get_multigroup_threshold(
-            input_tensor,
-            threshold_lowers,
-            threshold_uppers
+            input_tensor, threshold_lowers, threshold_uppers
         )
 
         result_tensor = torch.zeros_like(input_tensor).to(
             input_tensor.device
         ).half()
 
-        # Process each threshold group
-        for idx in range(len(threshold_lowers)):
+        if quantize_outlier:
 
-            mask = masks[idx]
-            x = grouped_tensors[idx].float()
+            # Quantize inner-most group (original behavior: no mean subtraction)
+            minval_tensor = torch.min(
+                grouped_tensors[-1], dim=-1
+            ).values.unsqueeze(-1)
 
-            # Middle group: direct FP4 quantization, no mean subtraction
-            if idx == len(threshold_lowers) - 1:
+            maxval_tensor = torch.max(
+                grouped_tensors[-1], dim=-1
+            ).values.unsqueeze(-1)
 
-                print("[DEBUG] Middle group: Direct E2M1 FP4")
+            grouped_tensors[-1] = cls.uniform_quantization_threshold(
+                grouped_tensors[-1],
+                cls.OUTLIER_BITS,
+                minval_tensor,
+                maxval_tensor
+            )
 
-                quantized = cls.fp4_e2m1_masked_quantization(
-                    x, mask
-                )
+            # Quantize outer groups using separate token-wise means
+            for idx in range(len(threshold_lowers) - 1):
 
-            # Outlier groups: separate token-wise mean subtraction
-            else:
+                mask = masks[idx]
+                x = grouped_tensors[idx].float()
 
-                print("[DEBUG] Outlier group: Mean subtraction + E2M1 FP4")
-
+                # Calculate token-wise mean for this group
                 valid = mask.any(dim=-1, keepdim=True)
 
                 mean = x.sum(dim=-1, keepdim=True) / mask.sum(
@@ -209,18 +118,46 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     torch.zeros_like(mean)
                 )
 
+                # Mean subtraction
                 residual = (x - mean) * mask
 
-                quantized_residual = cls.fp4_e2m1_masked_quantization(
-                    residual, mask
+                # Preserve original bit allocation
+                if idx == len(threshold_lowers) - 2:
+                    bits = cls.QUANTIZE_BITS
+                else:
+                    bits = cls.OUTLIER_BITS
+
+                # Quantize residuals
+                quantized_residual = cls.tokenwise_masked_quantization(
+                    residual, mask, bits
                 )
 
-                quantized = quantized_residual + mean * mask
+                # Restore mean
+                grouped_tensors[idx] = (
+                    quantized_residual + mean * mask
+                )
 
-            grouped_tensors[idx] = quantized
+        else:
+            # Original middle-group quantization (no mean subtraction)
+            minval_tensor = torch.min(
+                grouped_tensors[-2], dim=-1
+            ).values.unsqueeze(-1)
+
+            maxval_tensor = torch.max(
+                grouped_tensors[-2], dim=-1
+            ).values.unsqueeze(-1)
+
+            grouped_tensors[-2] = cls.uniform_quantization_threshold(
+                grouped_tensors[-2],
+                cls.QUANTIZE_BITS,
+                minval_tensor,
+                maxval_tensor
+            )
 
         # Reconstruct final tensor
-        for tensor, mask in zip(grouped_tensors, masks):
+        for idx, (tensor, mask) in enumerate(
+            zip(grouped_tensors, masks)
+        ):
             result_tensor += tensor * mask
 
         heat_map = None
