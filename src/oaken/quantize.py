@@ -155,52 +155,68 @@ class OakenQuantizer:
         truncated = int16_tensor & 0b1_11111_1110_0000_00
         return truncated.view(torch.float16)
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
-    def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
-                    quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
-        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
+    def downsample(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float],
+        quantize_outlier: bool = False,
+        use_group_shift: bool = True
+    ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
 
-            mean = input_tensor.float().mean(dim=-1, keepdim=True)
-        
-            # Quantize each threshold group using the same mean
-            for idx in range(len(threshold_lowers)):
-        
-                mask = masks[idx]
-                x = grouped_tensors[idx].float()
-        
-                # Subtract the shared token-wise mean
-                residual = (x - mean) * mask
-        
-                # Preserve original bit allocation
-                if idx == len(threshold_lowers) - 2:
-                    bits = cls.QUANTIZE_BITS
-                else:
-                    bits = cls.OUTLIER_BITS
-                
-                # Quantize residuals
-                if bits == 4:
-                    print("[DEBUG] Executing E2M1 FP4 quantization")
-                    quantized_residual = cls.fp4_e2m1_masked_quantization(
-                        residual, mask
-                    )
-                else:
-                    print("[DEBUG] Executing 5-bit integer quantization")
-                    quantized_residual = cls.tokenwise_masked_quantization(
-                        residual, mask, bits
-                    )
-        
-                # Restore the same mean
-                grouped_tensors[idx] = (
-                    quantized_residual + mean * mask
+        grouped_tensors, masks = cls.get_multigroup_threshold(
+            input_tensor, threshold_lowers, threshold_uppers
+        )
+
+        result_tensor = torch.zeros_like(input_tensor).to(
+            input_tensor.device
+        ).half()
+
+        # Calculate one shared token-wise mean
+        mean = input_tensor.float().mean(dim=-1, keepdim=True)
+
+        # Quantize every threshold group using the same mean
+        for idx in range(len(threshold_lowers)):
+
+            mask = masks[idx]
+            x = grouped_tensors[idx].float()
+
+            # Subtract shared mean
+            residual = (x - mean) * mask
+
+            # Preserve original bit allocation
+            if idx == len(threshold_lowers) - 2:
+                bits = cls.QUANTIZE_BITS
+            else:
+                bits = cls.OUTLIER_BITS
+
+            # Quantize residuals
+            if bits == 4:
+                print("[DEBUG] Executing E2M1 FP4 quantization")
+                quantized_residual = cls.fp4_e2m1_masked_quantization(
+                    residual, mask
+                )
+            else:
+                print("[DEBUG] Executing 5-bit integer quantization")
+                quantized_residual = cls.tokenwise_masked_quantization(
+                    residual, mask, bits
                 )
 
-        # heat_map = torch.zeros_like(input_tensor)
+            # Restore shared mean
+            grouped_tensors[idx] = quantized_residual + mean * mask
+
+        # Reconstruct final tensor
         for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
             result_tensor += tensor * mask
-            # heat_map += idx * mask
+
         heat_map = None
 
-        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
-        return (result_tensor, val_frac, heat_map)
+        val_frac = [
+            (torch.count_nonzero(mask) / torch.numel(mask)).item()
+            for mask in masks
+        ]
+
+        return result_tensor, val_frac, heat_map
