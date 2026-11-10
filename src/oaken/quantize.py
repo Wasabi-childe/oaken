@@ -15,50 +15,46 @@ class OakenQuantizer:
 
         return inlier, outlier, outlier_mask
 
+    
     @staticmethod
-    def mean_fp4_quantization(tensor, mask):
+    def mean_fp4_quantization(tensor):
         x = tensor.float()
-        mask = mask.bool()
     
         # Calculate token-wise mean
-        count = mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        mean = (x * mask).sum(dim=-1, keepdim=True) / count
-    
-        valid = mask.any(dim=-1, keepdim=True)
-        mean = torch.where(valid, mean, torch.zeros_like(mean))
+        mean = x.mean(dim=-1, keepdim=True)
     
         # Calculate residuals
-        residual = (x - mean) * mask
+        residual = x - mean
     
-        # E2M1 FP4 representable positive values
+        # E2M1 FP4 levels
         fp4_levels = torch.tensor(
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
             device=x.device
         )
     
-        # Scale residuals to the FP4 range
+        # Calculate scale
         max_abs = residual.abs().amax(dim=-1, keepdim=True)
         scale = max_abs / 6.0
         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     
+        # Normalize residuals
         normalized = residual / scale
     
-        # Find nearest FP4 value
+        # Find nearest FP4 level
         distances = (
-            normalized.unsqueeze(-1).abs()
-            - fp4_levels
+            normalized.abs().unsqueeze(-1) - fp4_levels
         ).abs()
     
         indices = distances.argmin(dim=-1)
     
         # Restore sign
-        fp4_values = fp4_levels[indices]
-        fp4_values = fp4_values * torch.sign(residual)
+        quantized = fp4_levels[indices] * torch.sign(residual)
     
-        # Reconstruct original values
-        reconstructed = fp4_values * scale + mean
+        # Reconstruct values
+        reconstructed = quantized * scale + mean
     
-        return reconstructed * mask
+        return reconstructed
+
     @staticmethod
     def mean_symmetric_quantization(tensor, mask, bits):
         x = tensor.float()
@@ -139,49 +135,26 @@ class OakenQuantizer:
         truncated = int16_tensor & 0b1_11111_1110_0000_00
         return truncated.view(torch.float16)
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(
         cls,
         input_tensor: torch.Tensor,
-        threshold_lowers: list[float],
-        threshold_uppers: list[float],
-        quantize_outlier: bool = True,
-        use_group_shift: bool = True
+        threshold_lowers: list[float] = None,
+        threshold_uppers: list[float] = None,
+        quantize_outlier: bool = False,
+        use_group_shift: bool = False
     ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
 
-        grouped_tensors, masks = cls.get_multigroup_threshold(
-            input_tensor, threshold_lowers, threshold_uppers
-        )
+        # Quantize the entire input token-wise using FP4
+        result_tensor = cls.mean_fp4_quantization(input_tensor)
 
-        result_tensor = torch.zeros_like(input_tensor).half()
+        result_tensor = result_tensor.half()
 
-        if quantize_outlier:
-
-            # Quantize all threshold groups using FP4
-            for idx in range(len(grouped_tensors)):
-                grouped_tensors[idx] = cls.mean_fp4_quantization(
-                    grouped_tensors[idx],
-                    masks[idx]
-                )
-
-        else:
-
-            # Quantize only the middle group using FP4
-            grouped_tensors[-2] = cls.mean_fp4_quantization(
-                grouped_tensors[-2],
-                masks[-2]
-            )
-
-        # Reconstruct final tensor
-        for tensor, mask in zip(grouped_tensors, masks):
-            result_tensor += tensor * mask
-
+        # No threshold groups or outliers
+        val_frac = [1.0]
         heat_map = None
 
-        val_frac = [
-            (torch.count_nonzero(mask) / torch.numel(mask)).item()
-            for mask in masks
-        ]
-
         return result_tensor, val_frac, heat_map
+
