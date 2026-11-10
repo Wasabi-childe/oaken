@@ -81,7 +81,6 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             input_tensor.device
         ).half()
         
-        quantize_outlier = True
         if quantize_outlier:
 
             # Quantize inner-most group (original behavior: no mean subtraction)
@@ -120,7 +119,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
 
                 # Mean subtraction
-                residual = (x - mean) * mask
+                residual = (x - 2) * mask
 
                 # Preserve original bit allocation
                 if idx == len(threshold_lowers) - 2:
