@@ -176,23 +176,30 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ).half()
 
         # Calculate one shared token-wise mean
-        mean = input_tensor.float().mean(dim=-1, keepdim=True)
-
-        # Quantize every threshold group using the same mean
+        # Quantize every threshold group using its own token-wise mean
         for idx in range(len(threshold_lowers)):
-
+        
             mask = masks[idx]
             x = grouped_tensors[idx].float()
-
-            # Subtract shared mean
+        
+            # Calculate a separate mean for this group and each token
+            valid = mask.any(dim=-1, keepdim=True)
+        
+            mean = x.sum(dim=-1, keepdim=True) / mask.sum(
+                dim=-1, keepdim=True
+            ).clamp(min=1)
+        
+            mean = torch.where(valid, mean, torch.zeros_like(mean))
+        
+            # Subtract this group's mean
             residual = (x - mean) * mask
-
+        
             # Preserve original bit allocation
             if idx == len(threshold_lowers) - 2:
                 bits = cls.QUANTIZE_BITS
             else:
                 bits = cls.OUTLIER_BITS
-
+        
             # Quantize residuals
             if bits == 4:
                 print("[DEBUG] Executing E2M1 FP4 quantization")
@@ -204,10 +211,11 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 quantized_residual = cls.tokenwise_masked_quantization(
                     residual, mask, bits
                 )
-
-            # Restore shared mean
+        
+            # Restore this group's own mean
             grouped_tensors[idx] = quantized_residual + mean * mask
 
+       
         # Reconstruct final tensor
         for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
             result_tensor += tensor * mask
