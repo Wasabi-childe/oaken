@@ -6,6 +6,7 @@ from src.oaken.quantize import *
 import pandas as pd
 
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
+    print("[INFO] Running Oaken with shared-mean E2M1 FP4 quantization (v2)")
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
         n_quant_group = 1
