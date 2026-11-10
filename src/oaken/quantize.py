@@ -98,55 +98,30 @@ class OakenQuantizer:
 
 
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
     @classmethod
     def downsample(
         cls,
         input_tensor: torch.Tensor,
-        threshold_lowers: list[float],
-        threshold_uppers: list[float],
-        quantize_outlier: bool = True,
-        use_group_shift: bool = True
+        threshold_lowers: list[float] = None,
+        threshold_uppers: list[float] = None,
+        quantize_outlier: bool = False,
+        use_group_shift: bool = False
     ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
 
-        grouped_tensors, masks = cls.get_multigroup_threshold(
-            input_tensor, threshold_lowers, threshold_uppers
-        )
+        # Create a mask covering the entire input
+        mask = torch.ones_like(input_tensor, dtype=torch.bool)
 
-        result_tensor = torch.zeros_like(input_tensor).to(
-            input_tensor.device
+        # Apply token-wise mean subtraction and symmetric quantization
+        result_tensor = cls.mean_symmetric_quantization(
+            input_tensor,
+            mask,
+            cls.QUANTIZE_BITS
         ).half()
-        
-        if quantize_outlier:
-
-            # Preserve original bit allocation
-            if idx == len(threshold_lowers) - 2:
-                bits = cls.QUANTIZE_BITS
-            else:
-                bits = cls.QUANTIZE_BITS
-            
-            # Mean subtraction + symmetric quantization + mean restoration
-            grouped_tensors[idx] = cls.mean_symmetric_quantization(
-                x, mask, bits
-            )
-
-        else:
-            # Quantize middle group using mean subtraction + symmetric quantization
-            grouped_tensors[-2] = cls.mean_symmetric_quantization(
-                grouped_tensors[-2],
-                masks[-2],
-                cls.QUANTIZE_BITS
-            )
-        # Reconstruct final tensor
-        for idx, (tensor, mask) in enumerate(
-            zip(grouped_tensors, masks)
-        ):
-            result_tensor += tensor * mask
 
         heat_map = None
 
-        val_frac = [
-            (torch.count_nonzero(mask) / torch.numel(mask)).item()
-            for mask in masks
-        ]
+        val_frac = [1.0]
 
         return result_tensor, val_frac, heat_map
+
