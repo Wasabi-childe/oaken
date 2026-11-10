@@ -153,7 +153,18 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 minval_tensor,
                 maxval_tensor
             )
-
+        print("DOWNsample CALLED")
+        
+        print("Input mean:", input_tensor.float().mean().item())
+        print("Input std:", input_tensor.float().std().item())
+        
+        for idx in range(len(threshold_lowers)):
+            print(
+                "Group", idx,
+                "fraction:", masks[idx].float().mean().item(),
+                "mean:", grouped_tensors[idx].float().mean().item(),
+                "std:", grouped_tensors[idx].float().std().item()
+            )
         # Reconstruct final tensor
         for idx, (tensor, mask) in enumerate(
             zip(grouped_tensors, masks)
