@@ -15,7 +15,50 @@ class OakenQuantizer:
 
         return inlier, outlier, outlier_mask
 
+    @staticmethod
+    def mean_fp4_quantization(tensor, mask):
+        x = tensor.float()
+        mask = mask.bool()
     
+        # Calculate token-wise mean
+        count = mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        mean = x.sum(dim=-1, keepdim=True) / count
+    
+        valid = mask.any(dim=-1, keepdim=True)
+        mean = torch.where(valid, mean, torch.zeros_like(mean))
+    
+        # Calculate residuals
+        residual = (x - mean) * mask
+    
+        # E2M1 FP4 representable positive values
+        fp4_levels = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            device=x.device
+        )
+    
+        # Scale residuals to the FP4 range
+        max_abs = residual.abs().amax(dim=-1, keepdim=True)
+        scale = max_abs / 6.0
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    
+        normalized = residual / scale
+    
+        # Find nearest FP4 value
+        distances = (
+            normalized.unsqueeze(-1).abs()
+            - fp4_levels
+        ).abs()
+    
+        indices = distances.argmin(dim=-1)
+    
+        # Restore sign
+        fp4_values = fp4_levels[indices]
+        fp4_values = fp4_values * torch.sign(residual)
+    
+        # Reconstruct original values
+        reconstructed = fp4_values * scale + mean
+    
+        return reconstructed * mask
     @staticmethod
     def mean_symmetric_quantization(tensor, mask, bits):
         x = tensor.float()
@@ -97,6 +140,7 @@ class OakenQuantizer:
         return truncated.view(torch.float16)
 
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(
@@ -112,34 +156,26 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             input_tensor, threshold_lowers, threshold_uppers
         )
 
-        result_tensor = torch.zeros_like(input_tensor).to(
-            input_tensor.device
-        ).half()
-        
-        if quantize_outlier:
+        result_tensor = torch.zeros_like(input_tensor).half()
 
-            # Preserve original bit allocation
-            if idx == len(threshold_lowers) - 2:
-                bits = cls.QUANTIZE_BITS
-            else:
-                bits = cls.QUANTIZE_BITS
-            
-            # Mean subtraction + symmetric quantization + mean restoration
-            grouped_tensors[idx] = cls.mean_symmetric_quantization(
-                x, mask, bits
-            )
+        if quantize_outlier:
+            # Quantize each group using E2M1 FP4
+            for idx, (tensor, mask) in enumerate(
+                zip(grouped_tensors, masks)
+            ):
+                grouped_tensors[idx] = cls.mean_fp4_quantization(
+                    tensor, mask
+                )
 
         else:
-            # Quantize middle group using mean subtraction + symmetric quantization
-            grouped_tensors[-2] = cls.mean_symmetric_quantization(
+            # Quantize only the middle group using E2M1 FP4
+            grouped_tensors[-2] = cls.mean_fp4_quantization(
                 grouped_tensors[-2],
-                masks[-2],
-                cls.QUANTIZE_BITS
+                masks[-2]
             )
-        # Reconstruct final tensor
-        for idx, (tensor, mask) in enumerate(
-            zip(grouped_tensors, masks)
-        ):
+
+        # Reconstruct final tensor from all groups
+        for tensor, mask in zip(grouped_tensors, masks):
             result_tensor += tensor * mask
 
         heat_map = None
@@ -150,3 +186,4 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ]
 
         return result_tensor, val_frac, heat_map
+
