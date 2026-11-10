@@ -162,9 +162,6 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
         result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
 
-        if quantize_outlier:
-            # Calculate one token-wise mean across all values
-            # (all three threshold groups combined)
             mean = input_tensor.float().mean(dim=-1, keepdim=True)
         
             # Quantize each threshold group using the same mean
@@ -198,12 +195,6 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 grouped_tensors[idx] = (
                     quantized_residual + mean * mask
                 )
-
-        else:
-            # Quantize middle_group
-            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-2] = cls.uniform_quantization_threshold(grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor)
 
         # heat_map = torch.zeros_like(input_tensor)
         for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
