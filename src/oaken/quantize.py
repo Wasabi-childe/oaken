@@ -80,7 +80,8 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         result_tensor = torch.zeros_like(input_tensor).to(
             input_tensor.device
         ).half()
-
+        
+        quantize_outlier = True
         if quantize_outlier:
 
             # Quantize inner-most group (original behavior: no mean subtraction)
