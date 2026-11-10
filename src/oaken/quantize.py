@@ -128,37 +128,37 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
         result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
 
-    if quantize_outlier:
-        # Calculate one token-wise mean across all values
-        # (all three threshold groups combined)
-        mean = input_tensor.float().mean(dim=-1, keepdim=True)
-    
-        # Quantize each threshold group using the same mean
-        for idx in range(len(threshold_lowers)):
-    
-            mask = masks[idx]
-            x = grouped_tensors[idx].float()
-    
-            # Subtract the shared token-wise mean
-            residual = (x - mean) * mask
-    
-            # Preserve original bit allocation
-            if idx == len(threshold_lowers) - 2:
-                bits = cls.QUANTIZE_BITS
-            else:
-                bits = cls.OUTLIER_BITS
-    
-            # Quantize residuals
-            quantized_residual = cls.tokenwise_masked_quantization(
-                residual,
-                mask,
-                bits
-            )
-    
-            # Restore the same mean
-            grouped_tensors[idx] = (
-                quantized_residual + mean * mask
-            )
+        if quantize_outlier:
+            # Calculate one token-wise mean across all values
+            # (all three threshold groups combined)
+            mean = input_tensor.float().mean(dim=-1, keepdim=True)
+        
+            # Quantize each threshold group using the same mean
+            for idx in range(len(threshold_lowers)):
+        
+                mask = masks[idx]
+                x = grouped_tensors[idx].float()
+        
+                # Subtract the shared token-wise mean
+                residual = (x - mean) * mask
+        
+                # Preserve original bit allocation
+                if idx == len(threshold_lowers) - 2:
+                    bits = cls.QUANTIZE_BITS
+                else:
+                    bits = cls.OUTLIER_BITS
+        
+                # Quantize residuals
+                quantized_residual = cls.tokenwise_masked_quantization(
+                    residual,
+                    mask,
+                    bits
+                )
+        
+                # Restore the same mean
+                grouped_tensors[idx] = (
+                    quantized_residual + mean * mask
+                )
 
         else:
             # Quantize middle_group
