@@ -156,7 +156,6 @@ class OakenQuantizer:
         return truncated.view(torch.float16)
 
 
-
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample(
@@ -168,7 +167,6 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         use_group_shift: bool = True
     ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
 
-        # Divide input into threshold groups
         grouped_tensors, masks = cls.get_multigroup_threshold(
             input_tensor,
             threshold_lowers,
@@ -179,38 +177,47 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             input_tensor.device
         ).half()
 
-        # Quantize every threshold group independently
+        # Process each threshold group
         for idx in range(len(threshold_lowers)):
 
             mask = masks[idx]
             x = grouped_tensors[idx].float()
 
-            # Calculate separate token-wise mean for this group
-            valid = mask.any(dim=-1, keepdim=True)
+            # Middle group: direct FP4 quantization, no mean subtraction
+            if idx == len(threshold_lowers) - 1:
 
-            mean = x.sum(dim=-1, keepdim=True) / mask.sum(
-                dim=-1, keepdim=True
-            ).clamp(min=1)
+                print("[DEBUG] Middle group: Direct E2M1 FP4")
 
-            mean = torch.where(
-                valid,
-                mean,
-                torch.zeros_like(mean)
-            )
+                quantized = cls.fp4_e2m1_masked_quantization(
+                    x, mask
+                )
 
-            # Subtract group-specific mean
-            residual = (x - mean) * mask
+            # Outlier groups: separate token-wise mean subtraction
+            else:
 
-            # Apply E2M1 FP4 quantization
-            print("[DEBUG] Executing E2M1 FP4 quantization")
+                print("[DEBUG] Outlier group: Mean subtraction + E2M1 FP4")
 
-            quantized_residual = cls.fp4_e2m1_masked_quantization(
-                residual,
-                mask
-            )
+                valid = mask.any(dim=-1, keepdim=True)
 
-            # Restore group-specific mean
-            grouped_tensors[idx] = quantized_residual + mean * mask
+                mean = x.sum(dim=-1, keepdim=True) / mask.sum(
+                    dim=-1, keepdim=True
+                ).clamp(min=1)
+
+                mean = torch.where(
+                    valid,
+                    mean,
+                    torch.zeros_like(mean)
+                )
+
+                residual = (x - mean) * mask
+
+                quantized_residual = cls.fp4_e2m1_masked_quantization(
+                    residual, mask
+                )
+
+                quantized = quantized_residual + mean * mask
+
+            grouped_tensors[idx] = quantized
 
         # Reconstruct final tensor
         for tensor, mask in zip(grouped_tensors, masks):
@@ -218,11 +225,9 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         heat_map = None
 
-        # Calculate fraction of values in each group
         val_frac = [
             (torch.count_nonzero(mask) / torch.numel(mask)).item()
             for mask in masks
         ]
 
         return result_tensor, val_frac, heat_map
-
