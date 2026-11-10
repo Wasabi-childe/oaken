@@ -119,7 +119,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 )
 
                 # Mean subtraction
-                residual = (x - 2) * mask
+                residual = (x - mean) * mask
 
                 # Preserve original bit allocation
                 if idx == len(threshold_lowers) - 2:
