@@ -150,4 +150,3 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         ]
 
         return result_tensor, val_frac, heat_map
-now i wanna remove outlier handling
