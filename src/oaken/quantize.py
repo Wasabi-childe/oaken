@@ -87,13 +87,29 @@ class OakenQuantizer:
         return group_tensors, group_masks
     
     @staticmethod
-    def uniform_quantization_threshold(tensor, bits: int, minval: torch.Tensor, maxval: torch.Tensor):
+    def uniform_quantization_threshold(tensor, bits: int, minval, maxval):
         rangeval = maxval - minval
-        qx = (2 ** bits - 1) / rangeval
-        offset = minval * qx
-        quantized = torch.round(qx * tensor - offset)
-        quantized = torch.nan_to_num(quantized, nan=2 ** bits - 1)
-        return (quantized + offset) / qx
+        qmax = (2 ** bits) - 1
+    
+        safe_range = torch.where(
+            rangeval > 0,
+            rangeval,
+            torch.ones_like(rangeval)
+        )
+    
+        quantized = torch.round(
+            (tensor - minval) * qmax / safe_range
+        )
+    
+        reconstructed = quantized * safe_range / qmax + minval
+    
+        reconstructed = torch.where(
+            rangeval > 0,
+            reconstructed,
+            minval
+        )
+    
+        return reconstructed
 
     @staticmethod
     def uniform_quantization(tensor, bits: int):
@@ -107,61 +123,102 @@ class OakenQuantizer:
         truncated = int16_tensor & 0b1_11111_1110_0000_00
         return truncated.view(torch.float16)
 
-class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
     @classmethod
-    def downsample(cls, input_tensor: torch.Tensor, threshold_lowers: list[float], threshold_uppers: list[float],
-                    quantize_outlier: bool=False, use_group_shift: bool=True) -> tuple[torch.Tensor, list[float], torch.Tensor]:
-        grouped_tensors, masks = cls.get_multigroup_threshold(input_tensor, threshold_lowers, threshold_uppers)
-        result_tensor = torch.zeros_like(input_tensor).to(input_tensor.device).half()
-
-       if quantize_outlier:
+    def downsample(
+        cls,
+        input_tensor: torch.Tensor,
+        threshold_lowers: list[float],
+        threshold_uppers: list[float],
+        quantize_outlier: bool = False,
+        use_group_shift: bool = True
+    ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
     
-        # Quantize all groups using token-wise mean subtraction
-        for idx in range(len(threshold_lowers)):
+        grouped_tensors, masks = cls.get_multigroup_threshold(
+            input_tensor,
+            threshold_lowers,
+            threshold_uppers
+        )
     
-            mask = masks[idx]
-            x = grouped_tensors[idx].float()
+        result_tensor = torch.zeros_like(input_tensor).half()
     
-            # Calculate token-wise mean for this group
-            count = mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        if quantize_outlier:
     
-            mean = (
-                (x * mask).sum(dim=-1, keepdim=True) / count
-            )
+            # Quantize all groups using token-wise mean subtraction
+            for idx in range(len(threshold_lowers)):
     
-            # Subtract mean
-            residual = (x - mean) * mask
+                mask = masks[idx]
+                x = grouped_tensors[idx].float()
     
-            # Preserve original bit allocation
-            if idx == len(threshold_lowers) - 1:
-                bits = cls.OUTLIER_BITS
-            elif idx == len(threshold_lowers) - 2:
-                bits = cls.QUANTIZE_BITS
-            else:
-                bits = cls.OUTLIER_BITS
+                # Calculate token-wise mean for this group
+                count = mask.sum(dim=-1, keepdim=True).clamp_min(1)
     
-            # Quantize residuals
-            quantized_residual = cls.tokenwise_masked_quantization(
-                residual,
-                mask,
-                bits
-            )
+                mean = (
+                    (x * mask).sum(dim=-1, keepdim=True) / count
+                )
     
-            # Add mean back
-            reconstructed = quantized_residual + mean * mask
+                # Subtract mean
+                residual = (x - mean) * mask
     
-            grouped_tensors[idx] = reconstructed.to(input_tensor.dtype)
+                # Preserve original bit allocation
+                if idx == len(threshold_lowers) - 2:
+                    bits = cls.QUANTIZE_BITS
+                else:
+                    bits = cls.OUTLIER_BITS
+    
+                # Quantize residuals
+                quantized_residual = cls.tokenwise_masked_quantization(
+                    residual,
+                    mask,
+                    bits
+                )
+    
+                # Add mean back
+                reconstructed = quantized_residual + mean * mask
+    
+                grouped_tensors[idx] = reconstructed.to(input_tensor.dtype)
+    
         else:
-            # Quantize middle_group
-            minval_tensor = torch.min(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            maxval_tensor = torch.max(grouped_tensors[-2], dim=-1).values.unsqueeze(-1)
-            grouped_tensors[-2] = cls.uniform_quantization_threshold(grouped_tensors[-2], cls.QUANTIZE_BITS, minval_tensor, maxval_tensor)
-
-        # heat_map = torch.zeros_like(input_tensor)
-        for idx, (tensor, mask) in enumerate(zip(grouped_tensors, masks)):
+    
+            # Quantize middle group
+            middle_mask = masks[-2]
+            middle_tensor = grouped_tensors[-2]
+    
+            minval_tensor = middle_tensor.masked_fill(
+                ~middle_mask, float('inf')
+            ).amin(dim=-1, keepdim=True)
+    
+            maxval_tensor = middle_tensor.masked_fill(
+                ~middle_mask, float('-inf')
+            ).amax(dim=-1, keepdim=True)
+    
+            valid = middle_mask.any(dim=-1, keepdim=True)
+    
+            minval_tensor = torch.where(
+                valid, minval_tensor, torch.zeros_like(minval_tensor)
+            )
+    
+            maxval_tensor = torch.where(
+                valid, maxval_tensor, torch.zeros_like(maxval_tensor)
+            )
+    
+            grouped_tensors[-2] = cls.uniform_quantization_threshold(
+                middle_tensor,
+                cls.QUANTIZE_BITS,
+                minval_tensor,
+                maxval_tensor
+            ) * middle_mask
+    
+        # Combine reconstructed groups
+        for tensor, mask in zip(grouped_tensors, masks):
             result_tensor += tensor * mask
-            # heat_map += idx * mask
+    
+        val_frac = [
+            (torch.count_nonzero(mask) / torch.numel(mask)).item()
+            for mask in masks
+        ]
+    
         heat_map = None
+    
+        return result_tensor, val_frac, heat_map
 
-        val_frac = [(torch.count_nonzero(mask) / torch.numel(mask)).item() for mask in masks]
-        return (result_tensor, val_frac, heat_map)
