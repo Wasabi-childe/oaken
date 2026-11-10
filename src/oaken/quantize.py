@@ -14,7 +14,41 @@ class OakenQuantizer:
         inlier = input_tensor * ~outlier_mask
 
         return inlier, outlier, outlier_mask
-
+    @staticmethod
+    def fp4_e2m1_masked_quantization(tensor, mask):
+        x = tensor.float()
+        mask = mask.bool()
+    
+        # E2M1 FP4 representable values
+        codebook = torch.tensor(
+            [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+              0.5,  1.0,  1.5,  2.0,  3.0,  4.0, 6.0],
+            device=x.device
+        )
+    
+        # Find maximum absolute value for each token
+        max_abs = x.abs().masked_fill(~mask, 0.0).amax(
+            dim=-1, keepdim=True
+        )
+    
+        # Scale values into the FP4 range [-6, 6]
+        scale = max_abs / 6.0
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    
+        normalized = x / scale
+    
+        # Find nearest E2M1 representable value
+        distances = torch.abs(
+            normalized.unsqueeze(-1) - codebook
+        )
+    
+        indices = distances.argmin(dim=-1)
+        quantized = codebook[indices]
+    
+        # Reconstruct original-scale values
+        reconstructed = quantized * scale
+    
+        return reconstructed * mask
     @staticmethod
     def tokenwise_masked_quantization(
         tensor: torch.Tensor,
@@ -149,11 +183,19 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                     bits = cls.OUTLIER_BITS
         
                 # Quantize residuals
-                quantized_residual = cls.tokenwise_masked_quantization(
-                    residual,
-                    mask,
-                    bits
-                )
+                if bits == 4:
+                    # Use E2M1 FP4 for the middle group
+                    quantized_residual = cls.fp4_e2m1_masked_quantization(
+                        residual,
+                        mask
+                    )
+                else:
+                    # Keep existing 5-bit quantization for outer groups
+                    quantized_residual = cls.tokenwise_masked_quantization(
+                        residual,
+                        mask,
+                        bits
+                    )
         
                 # Restore the same mean
                 grouped_tensors[idx] = (
