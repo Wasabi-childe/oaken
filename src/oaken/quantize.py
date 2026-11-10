@@ -118,36 +118,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         
         if quantize_outlier:
 
-            # Calculate token-wise mean for this group
-            valid = mask.any(dim=-1, keepdim=True)
-            
-            mean = x.sum(dim=-1, keepdim=True) / mask.sum(
-                dim=-1, keepdim=True
-            ).clamp(min=1)
-            
-            mean = torch.where(
-                valid,
-                mean,
-                torch.zeros_like(mean)
-            )
-            
-            # Mean subtraction
-            residual = (x - mean) * mask
-            
             # Preserve original bit allocation
             if idx == len(threshold_lowers) - 2:
                 bits = cls.QUANTIZE_BITS
             else:
                 bits = cls.OUTLIER_BITS
             
-            # Quantize residuals
-            quantized_residual = cls.tokenwise_masked_quantization(
-                residual, mask, bits
-            )
-            
-            # Restore mean
-            grouped_tensors[idx] = (
-                quantized_residual + mean * mask
+            # Mean subtraction + symmetric quantization + mean restoration
+            grouped_tensors[idx] = cls.mean_symmetric_quantization(
+                x, mask, bits
             )
 
         else:
