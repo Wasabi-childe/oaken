@@ -184,15 +184,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 
                 # Quantize residuals
                 if bits == 4:
-                print("[DEBUG] Executing E2M1 FP4 quantization")
-                quantized_residual = cls.fp4_e2m1_masked_quantization(
-                    residual, mask
-                )
+                    print("[DEBUG] Executing E2M1 FP4 quantization")
+                    quantized_residual = cls.fp4_e2m1_masked_quantization(
+                        residual, mask
+                    )
                 else:
-                print("[DEBUG] Executing 5-bit integer quantization")
-                quantized_residual = cls.tokenwise_masked_quantization(
-                    residual, mask, bits
-                )
+                    print("[DEBUG] Executing 5-bit integer quantization")
+                    quantized_residual = cls.tokenwise_masked_quantization(
+                        residual, mask, bits
+                    )
         
                 # Restore the same mean
                 grouped_tensors[idx] = (
