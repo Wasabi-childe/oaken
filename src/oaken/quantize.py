@@ -130,22 +130,12 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             )
 
         else:
-            # Original middle-group quantization (no mean subtraction)
-            minval_tensor = torch.min(
-                grouped_tensors[-2], dim=-1
-            ).values.unsqueeze(-1)
-
-            maxval_tensor = torch.max(
-                grouped_tensors[-2], dim=-1
-            ).values.unsqueeze(-1)
-
-            grouped_tensors[-2] = cls.uniform_quantization_threshold(
+            # Quantize middle group using mean subtraction + symmetric quantization
+            grouped_tensors[-2] = cls.mean_symmetric_quantization(
                 grouped_tensors[-2],
-                cls.QUANTIZE_BITS,
-                minval_tensor,
-                maxval_tensor
+                masks[-2],
+                cls.QUANTIZE_BITS
             )
-
         # Reconstruct final tensor
         for idx, (tensor, mask) in enumerate(
             zip(grouped_tensors, masks)
