@@ -69,7 +69,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         input_tensor: torch.Tensor,
         threshold_lowers: list[float],
         threshold_uppers: list[float],
-        quantize_outlier: bool = False,
+        quantize_outlier: bool = True,
         use_group_shift: bool = True
     ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
 
