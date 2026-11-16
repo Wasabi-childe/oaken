@@ -136,25 +136,176 @@ class OakenQuantizer:
         return truncated.view(torch.float16)
 
 
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
+
+    FP4_LEVELS = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    )
+
+    OUTLIERS_PER_GROUP = 4
+    HEADS_PER_GROUP = 2
+    GROUP_SIZE = 128
+
     @classmethod
-    def downsample(
+    def downsample_config_c(
         cls,
         input_tensor: torch.Tensor,
-        threshold_lowers: list[float] = None,
-        threshold_uppers: list[float] = None,
-        quantize_outlier: bool = False,
-        use_group_shift: bool = False
-    ) -> tuple[torch.Tensor, list[float], torch.Tensor]:
+        num_heads: int,
+        is_key: bool
+    ):
 
-        # Quantize the entire input token-wise using FP4
-        result_tensor = cls.mean_fp4_quantization(input_tensor)
+        original_shape = input_tensor.shape
+        original_dtype = input_tensor.dtype
 
-        result_tensor = result_tensor.half()
+        x = input_tensor.float()
 
-        # No threshold groups or outliers
-        val_frac = [1.0]
-        heat_map = None
+        # ------------------------------------------------
+        # 1. Reshape into attention heads
+        # ------------------------------------------------
 
-        return result_tensor, val_frac, heat_map
+        hidden_size = x.shape[-1]
+        head_dim = hidden_size // num_heads
+
+        assert hidden_size % num_heads == 0
+        assert head_dim == 64
+        assert num_heads % cls.HEADS_PER_GROUP == 0
+
+        # (..., sequence, heads, 64)
+        x = x.reshape(*x.shape[:-1], num_heads, head_dim)
+
+        # Combine every two adjacent heads:
+        # (..., sequence, groups, 128)
+        num_groups = num_heads // cls.HEADS_PER_GROUP
+
+        x = x.reshape(
+            *x.shape[:-2],
+            num_groups,
+            cls.GROUP_SIZE
+        )
+
+        # ------------------------------------------------
+        # 2. Select K outliers
+        # ------------------------------------------------
+
+        if is_key:
+
+            # Select four largest absolute values
+            # independently for each token and head-pair group.
+
+            indices = torch.topk(
+                x.abs(),
+                k=cls.OUTLIERS_PER_GROUP,
+                dim=-1
+            ).indices
+
+            outlier_mask = torch.zeros_like(x, dtype=torch.bool)
+
+            outlier_mask.scatter_(
+                -1,
+                indices,
+                True
+            )
+
+            # Direct FP8 E4M3 outlier storage
+            outliers = x.to(torch.float8_e4m3fn).float()
+
+        else:
+
+            # V has no outliers in Configuration C.
+            outlier_mask = torch.zeros_like(
+                x,
+                dtype=torch.bool
+            )
+
+            indices = None
+            outliers = None
+
+        # ------------------------------------------------
+        # 3. Separate regular values
+        # ------------------------------------------------
+
+        regular = x.masked_fill(outlier_mask, 0.0)
+
+        # ------------------------------------------------
+        # 4. Calculate one scale per 128-value group
+        # ------------------------------------------------
+
+        max_abs = regular.abs().amax(
+            dim=-1,
+            keepdim=True
+        )
+
+        scale = max_abs / 6.0
+
+        scale = torch.where(
+            scale > 0,
+            scale,
+            torch.ones_like(scale)
+        )
+
+        # Store scale as FP8 E4M3
+        scale = scale.to(torch.float8_e4m3fn).float()
+
+        # Handle possible FP8 underflow
+        scale = torch.where(
+            scale > 0,
+            scale,
+            torch.full_like(scale, 2 ** -9)
+        )
+
+        # ------------------------------------------------
+        # 5. Quantize regular values to FP4 E2M1
+        # ------------------------------------------------
+
+        normalized = regular / scale
+
+        levels = cls.FP4_LEVELS.to(
+            device=x.device,
+            dtype=x.dtype
+        )
+
+        distances = (
+            normalized.abs().unsqueeze(-1) - levels
+        ).abs()
+
+        nearest_indices = distances.argmin(dim=-1)
+
+        quantized = (
+            levels[nearest_indices] *
+            torch.sign(regular)
+        )
+
+        reconstructed = quantized * scale
+
+        # ------------------------------------------------
+        # 6. Restore K outliers
+        # ------------------------------------------------
+
+        if is_key:
+
+            reconstructed = torch.where(
+                outlier_mask,
+                outliers,
+                reconstructed
+            )
+
+        # ------------------------------------------------
+        # 7. Restore original tensor shape
+        # ------------------------------------------------
+
+        reconstructed = reconstructed.reshape(original_shape)
+
+        reconstructed = reconstructed.to(original_dtype)
+
+        # Fraction of values stored as outliers.
+        # K = 4/128; V = 0/128.
+
+        outlier_fraction = (
+            cls.OUTLIERS_PER_GROUP / cls.GROUP_SIZE
+            if is_key else 0.0
+        )
+
+        return reconstructed, [outlier_fraction], None
+
 
