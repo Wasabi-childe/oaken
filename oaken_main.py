@@ -70,7 +70,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 output,
                 [value_lower],
                 [value_upper],
-                cmean_abs_outlier=value_mean
+                mean_abs_outlier=value_mean
             )
         )
 
