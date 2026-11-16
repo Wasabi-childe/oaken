@@ -33,6 +33,34 @@ class OakenQuantizer:
         return inlier, outlier, outlier_mask
 
     @classmethod
+    def fp4_mean_quantize(
+        cls,
+        mean: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Convert a positive mean to the nearest FP4 E2M1 value.
+
+        This is direct FP4 rounding without an additional scale.
+        """
+
+        mean = mean.float()
+
+        levels = torch.tensor(
+            cls.FP4_LEVELS,
+            dtype=mean.dtype,
+            device=mean.device
+        )
+
+        boundaries = (levels[:-1] + levels[1:]) / 2.0
+
+        indices = torch.bucketize(
+            mean.contiguous(),
+            boundaries
+        )
+
+        return levels[indices]
+
+    @classmethod
     def fp4_quantize(
         cls,
         tensor: torch.Tensor
@@ -109,11 +137,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         use_mean_compensation: bool = False
     ):
         """
-        K: threshold-based outlier detection, one absolute outlier
-           mean per token, signed mean compensation, then FP4.
+        K:
+            Threshold-based outlier detection.
+            One absolute outlier mean per token.
+            Mean rounded to FP4 E2M1.
+            Signed mean compensation.
+            FP4 quantization.
 
-        V: direct whole-vector FP4 quantization without mean
-           compensation.
+        V:
+            Direct whole-vector FP4 quantization.
 
         Both K and V use one FP8 E4M3 scale per token.
         """
@@ -172,10 +204,8 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             ) / outlier_count
         )
 
-        # 3. Store mean in FP8 E4M3
-        mean_abs = mean_abs.to(
-            torch.float8_e4m3fn
-        ).float()
+        # 3. Convert mean to FP4 E2M1
+        mean_abs = cls.fp4_mean_quantize(mean_abs)
 
         # 4. Subtract signed mean from outlier positions
         signed_mean = x.sign() * mean_abs
