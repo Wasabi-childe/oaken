@@ -17,6 +17,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     print("[INFO] Group size: 128 (two attention heads)")
 
     num_heads = model.config.num_attention_heads
+    n_layer = len(model.get_decoder().layers)
     num_heads = model.config.num_key_value_heads  # 4
     head_dim = model.config.hidden_size // model.config.num_attention_heads  # 64
     
