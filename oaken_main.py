@@ -52,6 +52,8 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             MultiThresholdTokenwiseQuantizer.downsample_config_c(
                 output,
                 num_heads=num_heads,
+                heads_per_group=heads_per_group,
+                group_size=group_size,
                 is_key=True
             )
         )
@@ -71,6 +73,8 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
             MultiThresholdTokenwiseQuantizer.downsample_config_c(
                 output,
                 num_heads=num_heads,
+                heads_per_group=heads_per_group,
+                group_size=group_size,
                 is_key=False
             )
         )
