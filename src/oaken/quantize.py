@@ -40,6 +40,7 @@ class OakenQuantizer:
         FP4 E2M1 fake quantization.
 
         One scale per token, shared across the entire vector.
+        Scale is rounded to FP8 E4M3.
         """
 
         tensor = tensor.float()
@@ -50,12 +51,15 @@ class OakenQuantizer:
             keepdim=True
         )
 
-        scale = max_abs / 6.0
+        # Calculate and store scale in FP8 E4M3
+        scale = (max_abs / 6.0).to(
+            torch.float8_e4m3fn
+        ).float()
 
         # Avoid division by zero
         scale = torch.where(
-            scale < cls.FLOAT_TOLERANCE,
-            torch.ones_like(scale),
+            scale == 0,
+            torch.full_like(scale, 2.0 ** -9),
             scale
         )
 
@@ -88,9 +92,9 @@ class OakenQuantizer:
         # Dequantize
         reconstructed = quantized * scale
 
-        return reconstructed.to(torch.float16)
+        return reconstructed
 
-
+    
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
     @classmethod
@@ -103,15 +107,14 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         use_group_shift: bool = False
     ):
         """
-        Sign-aware outlier mean + whole-vector FP4 quantization.
+        Single absolute outlier mean + whole-vector FP4 quantization.
 
         1. Detect outliers using thresholds.
-        2. Separate positive and negative outliers.
-        3. Calculate separate means for positive and negative outliers
-           for each token.
-        4. Subtract the corresponding mean from outliers.
+        2. Calculate one mean of absolute outlier magnitudes per token.
+        3. Round the mean to FP8 E4M3.
+        4. Subtract the signed mean from each outlier.
         5. Quantize the entire modified vector using FP4 E2M1.
-        6. Add the corresponding mean back during reconstruction.
+        6. Add the signed mean back at original outlier positions.
 
         The same function is used for K and V.
         """
@@ -126,85 +129,54 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         threshold_upper = threshold_uppers[0]
 
         # ------------------------------------------------
-        # 1. Detect outliers
+        # 1. Convert input to FP32 and detect outliers
         # ------------------------------------------------
 
-        inlier, outlier, outlier_mask = cls.get_outlier_threshold(
-            input_tensor,
+        x = input_tensor.float()
+
+        _, _, outlier_mask = cls.get_outlier_threshold(
+            x,
             threshold_lower,
             threshold_upper
         )
 
         # ------------------------------------------------
-        # 2. Separate positive and negative outliers
+        # 2. Calculate one absolute outlier mean per token
         # ------------------------------------------------
 
-        positive_mask = (
-            outlier_mask & (input_tensor > 0)
-        )
-
-        negative_mask = (
-            outlier_mask & (input_tensor < 0)
-        )
-
-        # ------------------------------------------------
-        # 3. Calculate separate means per token
-        # ------------------------------------------------
-
-        positive_count = positive_mask.sum(
+        outlier_count = outlier_mask.sum(
             dim=-1,
             keepdim=True
         ).clamp(min=1)
 
-        negative_count = negative_mask.sum(
-            dim=-1,
-            keepdim=True
-        ).clamp(min=1)
-
-        positive_mean = (
-            (input_tensor * positive_mask).sum(
+        mean_abs = (
+            (x.abs() * outlier_mask).sum(
                 dim=-1,
                 keepdim=True
-            ) / positive_count
+            ) / outlier_count
         )
 
-        negative_mean = (
-            (input_tensor * negative_mask).sum(
-                dim=-1,
-                keepdim=True
-            ) / negative_count
-        )
-
-        # Handle tokens with no positive outliers
-        positive_mean = torch.where(
-            positive_mask.any(dim=-1, keepdim=True),
-            positive_mean,
-            torch.zeros_like(positive_mean)
-        )
-
-        # Handle tokens with no negative outliers
-        negative_mean = torch.where(
-            negative_mask.any(dim=-1, keepdim=True),
-            negative_mean,
-            torch.zeros_like(negative_mean)
-        )
+        # Store mean in FP8 E4M3
+        mean_abs = mean_abs.to(
+            torch.float8_e4m3fn
+        ).float()
 
         # ------------------------------------------------
-        # 4. Subtract corresponding mean from outliers
+        # 3. Subtract signed mean from outlier positions
         # ------------------------------------------------
 
-        modified_tensor = torch.where(
-            positive_mask,
-            input_tensor - positive_mean,
-            torch.where(
-                negative_mask,
-                input_tensor - negative_mean,
-                input_tensor
-            )
+        signed_mean = x.sign() * mean_abs
+
+        offset = torch.where(
+            outlier_mask,
+            signed_mean,
+            torch.zeros_like(x)
         )
 
+        modified_tensor = x - offset
+
         # ------------------------------------------------
-        # 5. Quantize the entire modified vector to FP4
+        # 4. Quantize the entire modified vector using FP4
         # ------------------------------------------------
 
         reconstructed = cls.fp4_quantize(
@@ -212,23 +184,15 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         )
 
         # ------------------------------------------------
-        # 6. Add means back to original outlier positions
+        # 5. Add signed mean back at outlier positions
         # ------------------------------------------------
 
-        reconstructed = torch.where(
-            positive_mask,
-            reconstructed + positive_mean,
-            torch.where(
-                negative_mask,
-                reconstructed + negative_mean,
-                reconstructed
-            )
-        )
+        reconstructed = reconstructed + offset
 
         reconstructed = reconstructed.to(torch.float16)
 
         # ------------------------------------------------
-        # 7. Calculate outlier fraction
+        # 6. Calculate outlier fraction
         # ------------------------------------------------
 
         val_frac = [
