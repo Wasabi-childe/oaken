@@ -44,11 +44,10 @@ def multi_key_value_tokenwise_main(args, runner):
 
     print("Called multi_key_value_tokenwise_main")
 
-    # This algorithm uses exactly one outlier fraction
     if len(args.list_fracs) != 1:
         raise ValueError(
             "Provide exactly one outlier fraction using -f. "
-            "Example: -f 0.02"
+            "Example: -f 0.05"
         )
 
     outlier_frac = args.list_fracs[0]
@@ -64,26 +63,30 @@ def multi_key_value_tokenwise_main(args, runner):
 
     start_time = time.monotonic()
 
-    # One lower and upper threshold per layer
-    stat = {
-        "key": [
-            {
-                "upper_threshold": 0.0,
-                "lower_threshold": 0.0,
-                "counter": 0
-            }
-            for _ in range(n_layer)
-        ],
+    # Statistics collected independently for every layer.
+    # K and V are kept separate.
 
-        "value": [
-            {
-                "upper_threshold": 0.0,
-                "lower_threshold": 0.0,
-                "counter": 0
-            }
-            for _ in range(n_layer)
-        ]
+    stat = {
+        "key": [],
+        "value": []
     }
+
+    for _ in range(n_layer):
+        stat["key"].append({
+            "upper_threshold": 0.0,
+            "lower_threshold": 0.0,
+            "threshold_counter": 0,
+            "outlier_abs_sum": 0.0,
+            "outlier_count": 0
+        })
+
+        stat["value"].append({
+            "upper_threshold": 0.0,
+            "lower_threshold": 0.0,
+            "threshold_counter": 0,
+            "outlier_abs_sum": 0.0,
+            "outlier_count": 0
+        })
 
     sample_rate = args.sample_rate
 
@@ -92,26 +95,30 @@ def multi_key_value_tokenwise_main(args, runner):
             "Sample rate must be greater than 0 and at most 1."
         )
 
-    # ---------------------------------------------
-    # V projection threshold profiling
-    # ---------------------------------------------
+    # ------------------------------------------------
+    # Shared function for K and V statistics
+    # ------------------------------------------------
 
-    def get_value_activation_stat_hook(
-        i, module, input, output
-    ):
+    def collect_activation_stats(output, layer_stat):
 
         if sample_rate != 1.0:
+            n_tokens = max(
+                1,
+                int(sample_rate * output.size(1))
+            )
+
             sampled_indices = torch.randperm(
                 output.size(1),
                 device=output.device
-            )[:int(sample_rate * output.size(1))]
+            )[:n_tokens]
 
             output_float32 = output[:, sampled_indices, :].float()
 
         else:
             output_float32 = output.float()
 
-        # Upper and lower thresholds
+        # Calculate thresholds for this batch.
+
         upper = torch.quantile(
             output_float32,
             1.0 - outlier_frac / 2.0,
@@ -126,57 +133,62 @@ def multi_key_value_tokenwise_main(args, runner):
             interpolation="lower"
         )
 
-        stat["value"][i]["upper_threshold"] += upper.half().cpu().item()
-        stat["value"][i]["lower_threshold"] += lower.half().cpu().item()
+        # Accumulate thresholds.
 
-        stat["value"][i]["counter"] += 1
+        layer_stat["upper_threshold"] += upper.item()
+        layer_stat["lower_threshold"] += lower.item()
+        layer_stat["threshold_counter"] += 1
+
+        # Identify outliers using this batch's thresholds.
+
+        outlier_mask = torch.logical_or(
+            output_float32 <= lower,
+            output_float32 >= upper
+        )
+
+        # Accumulate absolute outlier values.
+        # Only sum and count are retained, not the activations.
+
+        outlier_abs_sum = (
+            output_float32.abs() * outlier_mask
+        ).sum()
+
+        outlier_count = outlier_mask.sum()
+
+        layer_stat["outlier_abs_sum"] += outlier_abs_sum.item()
+        layer_stat["outlier_count"] += outlier_count.item()
 
         return output
 
-    # ---------------------------------------------
-    # K projection threshold profiling
-    # ---------------------------------------------
+    # ------------------------------------------------
+    # K projection hook
+    # ------------------------------------------------
 
     def get_key_activation_stat_hook(
         i, module, input, output
     ):
 
-        if sample_rate != 1.0:
-            sampled_indices = torch.randperm(
-                output.size(1),
-                device=output.device
-            )[:int(sample_rate * output.size(1))]
-
-            output_float32 = output[:, sampled_indices, :].float()
-
-        else:
-            output_float32 = output.float()
-
-        # Upper and lower thresholds
-        upper = torch.quantile(
-            output_float32,
-            1.0 - outlier_frac / 2.0,
-            dim=None,
-            interpolation="higher"
+        return collect_activation_stats(
+            output,
+            stat["key"][i]
         )
 
-        lower = torch.quantile(
-            output_float32,
-            outlier_frac / 2.0,
-            dim=None,
-            interpolation="lower"
+    # ------------------------------------------------
+    # V projection hook
+    # ------------------------------------------------
+
+    def get_value_activation_stat_hook(
+        i, module, input, output
+    ):
+
+        return collect_activation_stats(
+            output,
+            stat["value"][i]
         )
 
-        stat["key"][i]["upper_threshold"] += upper.half().cpu().item()
-        stat["key"][i]["lower_threshold"] += lower.half().cpu().item()
-
-        stat["key"][i]["counter"] += 1
-
-        return output
-
-    # ---------------------------------------------
+    # ------------------------------------------------
     # Register hooks
-    # ---------------------------------------------
+    # ------------------------------------------------
 
     for i, decoder in enumerate(model.get_decoder().layers):
 
@@ -188,9 +200,9 @@ def multi_key_value_tokenwise_main(args, runner):
             partial(get_value_activation_stat_hook, i)
         )
 
-    # ---------------------------------------------
-    # Run inference for profiling
-    # ---------------------------------------------
+    # ------------------------------------------------
+    # Run calibration
+    # ------------------------------------------------
 
     runner(
         args,
@@ -199,71 +211,87 @@ def multi_key_value_tokenwise_main(args, runner):
         torch_device
     )
 
-    # ---------------------------------------------
-    # Average thresholds
-    # ---------------------------------------------
+    # ------------------------------------------------
+    # Calculate final statistics
+    # ------------------------------------------------
 
     quantizer_stat = {
         "n_quant_group": 1,
 
         "key": {
             "upper_threshold": [],
-            "lower_threshold": []
+            "lower_threshold": [],
+            "mean_abs_outlier": []
         },
 
         "value": {
             "upper_threshold": [],
-            "lower_threshold": []
+            "lower_threshold": [],
+            "mean_abs_outlier": []
         }
     }
 
     for i in range(n_layer):
 
-        key_counter = stat["key"][i]["counter"]
-        value_counter = stat["value"][i]["counter"]
+        for kv_type in ["key", "value"]:
 
-        if key_counter == 0 or value_counter == 0:
-            raise RuntimeError(
-                "No activation statistics collected for layer "
-                + str(i)
+            layer_stat = stat[kv_type][i]
+
+            threshold_counter = layer_stat["threshold_counter"]
+            outlier_count = layer_stat["outlier_count"]
+
+            if threshold_counter == 0:
+                raise RuntimeError(
+                    "No activation statistics collected for "
+                    + kv_type + " layer " + str(i)
+                )
+
+            if outlier_count == 0:
+                raise RuntimeError(
+                    "No outliers collected for "
+                    + kv_type + " layer " + str(i)
+                )
+
+            # Average the batch thresholds.
+
+            upper_threshold = (
+                layer_stat["upper_threshold"] / threshold_counter
             )
 
-        key_upper = (
-            stat["key"][i]["upper_threshold"] / key_counter
-        )
+            lower_threshold = (
+                layer_stat["lower_threshold"] / threshold_counter
+            )
 
-        key_lower = (
-            stat["key"][i]["lower_threshold"] / key_counter
-        )
+            # One mean absolute outlier value per layer.
 
-        value_upper = (
-            stat["value"][i]["upper_threshold"] / value_counter
-        )
+            mean_abs_outlier = (
+                layer_stat["outlier_abs_sum"] / outlier_count
+            )
 
-        value_lower = (
-            stat["value"][i]["lower_threshold"] / value_counter
-        )
+            quantizer_stat[kv_type]["upper_threshold"].append(
+                [upper_threshold]
+            )
 
-        quantizer_stat["key"]["upper_threshold"].append(
-            [key_upper]
-        )
+            quantizer_stat[kv_type]["lower_threshold"].append(
+                [lower_threshold]
+            )
 
-        quantizer_stat["key"]["lower_threshold"].append(
-            [key_lower]
-        )
-
-        quantizer_stat["value"]["upper_threshold"].append(
-            [value_upper]
-        )
-
-        quantizer_stat["value"]["lower_threshold"].append(
-            [value_lower]
-        )
+            quantizer_stat[kv_type]["mean_abs_outlier"].append(
+                [mean_abs_outlier]
+            )
 
         print(
             "Decoder", i,
-            "K thresholds:", key_lower, key_upper,
-            "V thresholds:", value_lower, value_upper
+            "K thresholds:",
+            quantizer_stat["key"]["lower_threshold"][i][0],
+            quantizer_stat["key"]["upper_threshold"][i][0],
+            "K mean:",
+            quantizer_stat["key"]["mean_abs_outlier"][i][0],
+            "| V thresholds:",
+            quantizer_stat["value"]["lower_threshold"][i][0],
+            quantizer_stat["value"]["upper_threshold"][i][0],
+            "V mean:",
+            quantizer_stat["value"]["mean_abs_outlier"][i][0]
         )
 
     end_time = time.monotonic()
@@ -274,9 +302,9 @@ def multi_key_value_tokenwise_main(args, runner):
         "seconds"
     )
 
-    # ---------------------------------------------
-    # Save threshold statistics
-    # ---------------------------------------------
+    # ------------------------------------------------
+    # Save statistics
+    # ------------------------------------------------
 
     with open(args.output_file, mode="w") as f:
         json.dump(
@@ -285,7 +313,7 @@ def multi_key_value_tokenwise_main(args, runner):
             indent=2
         )
 
-    print("Threshold statistics saved to:", args.output_file)
+    print("Quantizer statistics saved to:", args.output_file)
 
 
 if __name__ == "__main__":
@@ -328,7 +356,7 @@ if __name__ == "__main__":
         type=float,
         required=True,
         dest="list_fracs",
-        help="One total outlier fraction, e.g. 0.02"
+        help="One total outlier fraction, e.g. 0.05"
     )
 
     parser.add_argument(

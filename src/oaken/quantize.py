@@ -4,10 +4,10 @@ from typing import Tuple
 
 
 class OakenQuantizer:
+
     QUANTIZE_BITS = 4
     FLOAT_TOLERANCE = 1e-6
 
-    # FP4 E2M1 positive magnitude levels
     FP4_LEVELS = [
         0.0, 0.5, 1.0, 1.5,
         2.0, 3.0, 4.0, 6.0
@@ -36,27 +36,20 @@ class OakenQuantizer:
         cls,
         tensor: torch.Tensor
     ) -> torch.Tensor:
-        """
-        FP4 E2M1 fake quantization.
-
-        One scale per token, shared across the entire vector.
-        Scale is rounded to FP8 E4M3.
-        """
 
         tensor = tensor.float()
 
-        # Calculate one scale per token
+        # One scale per token
         max_abs = tensor.abs().amax(
             dim=-1,
             keepdim=True
         )
 
-        # Calculate and store scale in FP8 E4M3
+        # FP8 E4M3 scale
         scale = (max_abs / 6.0).to(
             torch.float8_e4m3fn
         ).float()
 
-        # Avoid division by zero
         scale = torch.where(
             scale == 0,
             torch.full_like(scale, 2.0 ** -9),
@@ -66,17 +59,14 @@ class OakenQuantizer:
         # Normalize
         normalized = tensor / scale
 
-        # FP4 E2M1 levels
         levels = torch.tensor(
             cls.FP4_LEVELS,
             dtype=normalized.dtype,
             device=normalized.device
         )
 
-        # Midpoints between adjacent levels
         boundaries = (levels[:-1] + levels[1:]) / 2.0
 
-        # Find nearest FP4 magnitude
         indices = torch.bucketize(
             normalized.abs().contiguous(),
             boundaries
@@ -84,17 +74,15 @@ class OakenQuantizer:
 
         quantized_magnitude = levels[indices]
 
-        # Restore sign
         quantized = (
             normalized.sign() * quantized_magnitude
         )
 
-        # Dequantize
         reconstructed = quantized * scale
 
         return reconstructed
 
-    
+
 class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
     @classmethod
@@ -104,19 +92,22 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         threshold_lowers,
         threshold_uppers,
         quantize_outlier: bool = True,
-        use_group_shift: bool = False
+        use_group_shift: bool = False,
+        mean_abs_outlier=None
     ):
+
         """
-        Single absolute outlier mean + whole-vector FP4 quantization.
+        Offline-calibrated absolute outlier mean + FP4 quantization.
 
-        1. Detect outliers using thresholds.
-        2. Calculate one mean of absolute outlier magnitudes per token.
-        3. Round the mean to FP8 E4M3.
-        4. Subtract the signed mean from each outlier.
-        5. Quantize the entire modified vector using FP4 E2M1.
-        6. Add the signed mean back at original outlier positions.
+        1. Detect outliers using calibrated thresholds.
+        2. Load the pre-calibrated absolute outlier mean.
+        3. Round mean to FP8 E4M3.
+        4. Subtract signed mean at outlier positions.
+        5. Quantize the modified vector using FP4 E2M1.
+        6. Add the signed mean back at outlier positions.
 
-        The same function is used for K and V.
+        The mean is shared across tokens for each layer and
+        is supplied by the offline calibration JSON.
         """
 
         if len(threshold_lowers) != 1 or len(threshold_uppers) != 1:
@@ -125,14 +116,19 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
                 "one upper threshold."
             )
 
+        if mean_abs_outlier is None:
+            raise ValueError(
+                "A calibrated mean_abs_outlier must be provided."
+            )
+
         threshold_lower = threshold_lowers[0]
         threshold_upper = threshold_uppers[0]
 
-        # ------------------------------------------------
-        # 1. Convert input to FP32 and detect outliers
-        # ------------------------------------------------
-
         x = input_tensor.float()
+
+        # -----------------------------------------
+        # 1. Detect outliers
+        # -----------------------------------------
 
         _, _, outlier_mask = cls.get_outlier_threshold(
             x,
@@ -140,30 +136,32 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             threshold_upper
         )
 
-        # ------------------------------------------------
-        # 2. Calculate one absolute outlier mean per token
-        # ------------------------------------------------
+        # -----------------------------------------
+        # 2. Load offline-calibrated mean
+        # -----------------------------------------
 
-        outlier_count = outlier_mask.sum(
-            dim=-1,
-            keepdim=True
-        ).clamp(min=1)
+        if isinstance(mean_abs_outlier, (list, tuple)):
+            if len(mean_abs_outlier) != 1:
+                raise ValueError(
+                    "Expected exactly one calibrated mean."
+                )
 
-        mean_abs = (
-            (x.abs() * outlier_mask).sum(
-                dim=-1,
-                keepdim=True
-            ) / outlier_count
+            mean_abs_outlier = mean_abs_outlier[0]
+
+        mean_abs = torch.as_tensor(
+            mean_abs_outlier,
+            dtype=torch.float32,
+            device=x.device
         )
 
-        # Store mean in FP8 E4M3
+        # Store/use mean in FP8 E4M3
         mean_abs = mean_abs.to(
             torch.float8_e4m3fn
         ).float()
 
-        # ------------------------------------------------
-        # 3. Subtract signed mean from outlier positions
-        # ------------------------------------------------
+        # -----------------------------------------
+        # 3. Subtract signed mean at outlier positions
+        # -----------------------------------------
 
         signed_mean = x.sign() * mean_abs
 
@@ -175,25 +173,25 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         modified_tensor = x - offset
 
-        # ------------------------------------------------
-        # 4. Quantize the entire modified vector using FP4
-        # ------------------------------------------------
+        # -----------------------------------------
+        # 4. Quantize modified vector using FP4
+        # -----------------------------------------
 
         reconstructed = cls.fp4_quantize(
             modified_tensor
         )
 
-        # ------------------------------------------------
-        # 5. Add signed mean back at outlier positions
-        # ------------------------------------------------
+        # -----------------------------------------
+        # 5. Add mean back at original outlier positions
+        # -----------------------------------------
 
         reconstructed = reconstructed + offset
 
         reconstructed = reconstructed.to(torch.float16)
 
-        # ------------------------------------------------
+        # -----------------------------------------
         # 6. Calculate outlier fraction
-        # ------------------------------------------------
+        # -----------------------------------------
 
         val_frac = [
             outlier_mask.float().mean().item()
