@@ -11,13 +11,25 @@ from functools import partial
 
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
 
-    print("[INFO] Running Configuration C:")
+    print("[INFO] Running Configuration:")
     print("[INFO] K: Dynamic top-4 FP8 outliers + FP4")
     print("[INFO] V: FP4 only")
     print("[INFO] Group size: 128 (two attention heads)")
 
     num_heads = model.config.num_attention_heads
     n_layer = len(model.get_decoder().layers)
+    num_heads = model.config.num_key_value_heads
+    head_dim = model.config.head_dim
+    
+    heads_per_group = 2
+    group_size = heads_per_group * head_dim
+    
+    print("KV heads:", num_heads)          # 8
+    print("Head dimension:", head_dim)     # 64
+    print("Heads per group:", heads_per_group)  # 2
+    print("Groups:", num_heads // heads_per_group)  # 4
+    print("Group size:", group_size)       # 128
+    
     num_heads = model.config.num_key_value_heads  # 4
     head_dim = model.config.hidden_size // model.config.num_attention_heads  # 64
     
