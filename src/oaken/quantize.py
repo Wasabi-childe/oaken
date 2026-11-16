@@ -150,38 +150,36 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
     @classmethod
     def downsample_config_c(
         cls,
-        input_tensor: torch.Tensor,
-        num_heads: int,
-        is_key: bool
+        input_tensor,
+        num_heads,
+        heads_per_group,
+        group_size,
+        is_key
     ):
 
         original_shape = input_tensor.shape
         original_dtype = input_tensor.dtype
-
+        
         x = input_tensor.float()
-
-        # ------------------------------------------------
-        # 1. Reshape into attention heads
-        # ------------------------------------------------
-
-        hidden_size = x.shape[-1]
-        head_dim = hidden_size // num_heads
-
-        assert hidden_size % num_heads == 0
-        assert head_dim == 64
-        assert num_heads % cls.HEADS_PER_GROUP == 0
-
-        # (..., sequence, heads, 64)
-        x = x.reshape(*x.shape[:-1], num_heads, head_dim)
-
-        # Combine every two adjacent heads:
-        # (..., sequence, groups, 128)
-        num_groups = num_heads // cls.HEADS_PER_GROUP
-
+        
+        head_dim = x.shape[-1] // num_heads
+        
+        assert x.shape[-1] == num_heads * head_dim
+        assert num_heads % heads_per_group == 0
+        assert heads_per_group * head_dim == group_size
+        
+        x = x.reshape(
+            *x.shape[:-1],
+            num_heads,
+            head_dim
+        )
+        
+        num_groups = num_heads // heads_per_group
+        
         x = x.reshape(
             *x.shape[:-2],
             num_groups,
-            cls.GROUP_SIZE
+            group_size
         )
 
         # ------------------------------------------------
@@ -302,10 +300,8 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         # K = 4/128; V = 0/128.
 
         outlier_fraction = (
-            cls.OUTLIERS_PER_GROUP / cls.GROUP_SIZE
+            cls.OUTLIERS_PER_GROUP / group_size
             if is_key else 0.0
         )
 
         return reconstructed, [outlier_fraction], None
-
-
