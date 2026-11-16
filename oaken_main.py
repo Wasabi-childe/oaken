@@ -70,7 +70,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 output,
                 [value_lower],
                 [value_upper],
-                calibrated_mean=value_mean
+                cmean_abs_outlier=value_mean
             )
         )
 
@@ -99,7 +99,7 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 output,
                 [key_lower],
                 [key_upper],
-                calibrated_mean=key_mean
+                mean_abs_outlier=key_mean
             )
         )
 
