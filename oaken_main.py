@@ -5,85 +5,122 @@ from statistics import mean
 from src.oaken.quantize import *
 import pandas as pd
 
+
+from functools import partial
+
+
 def multi_group_oaken_main(args, model, tokenizer, device, runner):
-    print("[INFO] Running Oaken with shared-mean E2M1 FP4 quantization (v2)")
-    with open(args.quantizer_path, "r") as f:
-        quantizer_stat = json.load(f)
-        n_quant_group = 1
-        n_layer = len(model.get_decoder().layers)
 
-        sparsity_information = {
-            "key": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
-            "value": [[0.0 for i in range(n_quant_group)] for j in range(n_layer)],
-            "counter": [0.0 for j in range(n_layer)]
-        }
+    print("[INFO] Running Configuration C:")
+    print("[INFO] K: Dynamic top-4 FP8 outliers + FP4")
+    print("[INFO] V: FP4 only")
+    print("[INFO] Group size: 128 (two attention heads)")
 
-        key_counter = 0
-        value_counter = 0
+    num_heads = model.config.num_attention_heads
+    n_layer = len(model.get_decoder().layers)
 
-        def tokenwise_quantize_activation_hook(i, module, input, output):
-            tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample(
+    sparsity_information = {
+        "key": [0.0 for _ in range(n_layer)],
+        "value": [0.0 for _ in range(n_layer)],
+        "counter": [0.0 for _ in range(n_layer)]
+    }
+
+    # ------------------------------------------------
+    # K quantization hook
+    # ------------------------------------------------
+
+    def key_quantization_hook(i, module, input, output):
+
+        tensor, sparsity, heatmap = (
+            MultiThresholdTokenwiseQuantizer.downsample_config_c(
                 output,
-                quantizer_stat["value"]["lower_threshold"][i],
-                quantizer_stat["value"]["upper_threshold"][i],
-                args.quant_outlier,
-                use_group_shift=True,
+                num_heads=num_heads,
+                is_key=True
             )
-            sparsity_information["value"][i] = [sum(x) for x in zip(sparsity_information["value"][i], sparsity)]
-            sparsity_information["counter"][i] += 0.5
+        )
 
-            # nonlocal value_counter
-            # if value_counter < 10:
-            #     df = pd.DataFrame(heatmap.squeeze().int().cpu().numpy())
-            #     df.to_csv(f"heatmap/value_{i}_{value_counter}.csv", index=False)
-            #     value_counter += 1
+        sparsity_information["key"][i] += sparsity[0]
+        sparsity_information["counter"][i] += 0.5
 
-            return tensor.half()
+        return tensor
 
-        def channelwise_quantize_activation_hook(i, module, input, output):
-            #tensor, sparsity, heatmap = MultiThresholdChannelwiseQuantizer.downsample( #
-            tensor, sparsity, heatmap = MultiThresholdTokenwiseQuantizer.downsample( #
+    # ------------------------------------------------
+    # V quantization hook
+    # ------------------------------------------------
+
+    def value_quantization_hook(i, module, input, output):
+
+        tensor, sparsity, heatmap = (
+            MultiThresholdTokenwiseQuantizer.downsample_config_c(
                 output,
-                quantizer_stat["key"]["lower_threshold"][i],
-                quantizer_stat["key"]["upper_threshold"][i],
-                args.quant_outlier,
-                use_group_shift=True,
+                num_heads=num_heads,
+                is_key=False
             )
-            sparsity_information["key"][i] = [sum(x) for x in zip(sparsity_information["key"][i], sparsity)]
-            sparsity_information["counter"][i] += 0.5
+        )
 
-            # nonlocal key_counter
-            # if key_counter < 10:
-            #     df = pd.DataFrame(heatmap.squeeze().int().cpu().numpy())
-            #     df.to_csv(f"heatmap/key_{i}_{key_counter}.csv", index=False)
-            #     key_counter += 1
+        sparsity_information["value"][i] += sparsity[0]
+        sparsity_information["counter"][i] += 0.5
 
-            return tensor.half()
-    
-        for i, decoder in enumerate(model.get_decoder().layers):
-            decoder.self_attn.v_proj.register_forward_hook(partial(tokenwise_quantize_activation_hook, i))
-            decoder.self_attn.k_proj.register_forward_hook(partial(channelwise_quantize_activation_hook, i))
-        
-        runner(args, model, tokenizer, device)
+        return tensor
 
-        key_sparsity = []
-        value_sparsity = []
-        key_sparsity_sum = [0.0 for _ in range(n_quant_group)]
-        value_sparsity_sum = [0.0 for _ in range(n_quant_group)]
-        for i in range(n_layer):
-            key_sparsity.append(
-                list(map(lambda x: x / sparsity_information['counter'][i], sparsity_information['key'][i]))
-            )
-            value_sparsity.append(
-                list(map(lambda x: x / sparsity_information['counter'][i], sparsity_information['value'][i]))
-            )
-            print(f"Decoder {i} Sparsity: Key - {key_sparsity[i]}, Value - {value_sparsity[i]}")
-            for idx, item in enumerate(key_sparsity[i]):
-                key_sparsity_sum[idx] += item
-            for idx, item in enumerate(value_sparsity[i]):
-                value_sparsity_sum[idx] += item
+    # ------------------------------------------------
+    # Register hooks
+    # ------------------------------------------------
 
-        print(f"Total Sparsity: Key - {[x / n_layer for x in key_sparsity_sum]}, Value - {[x / n_layer for x in value_sparsity_sum]}")
+    for i, decoder in enumerate(model.get_decoder().layers):
+
+        decoder.self_attn.k_proj.register_forward_hook(
+            partial(key_quantization_hook, i)
+        )
+
+        decoder.self_attn.v_proj.register_forward_hook(
+            partial(value_quantization_hook, i)
+        )
+
+    # ------------------------------------------------
+    # Run inference
+    # ------------------------------------------------
+
+    runner(args, model, tokenizer, device)
+
+    # ------------------------------------------------
+    # Print statistics
+    # ------------------------------------------------
+
+    key_sparsity = []
+    value_sparsity = []
+
+    for i in range(n_layer):
+
+        count = sparsity_information["counter"][i]
+
+        key_value = (
+            sparsity_information["key"][i] / (count * 2)
+            if count > 0 else 0.0
+        )
+
+        value_value = (
+            sparsity_information["value"][i] / (count * 2)
+            if count > 0 else 0.0
+        )
+
+        key_sparsity.append(key_value)
+        value_sparsity.append(value_value)
+
+        print(
+            f"Decoder {i}: "
+            f"Key outlier fraction = {key_value:.5f}, "
+            f"Value outlier fraction = {value_value:.5f}"
+        )
+
+    print(
+        f"Average K outlier fraction: {sum(key_sparsity) / n_layer:.5f}"
+    )
+
+    print(
+        f"Average V outlier fraction: {sum(value_sparsity) / n_layer:.5f}"
+    )
+
 
 def key_channelwise_value_tokenwise_main(args, model, tokenizer, device, runner):
     sparsity_information = {
