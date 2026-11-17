@@ -11,6 +11,8 @@ def get_tokenizer(model: str, size: str):
         return get_mistral_tokenizer(size)
     elif model == "mixtral":
         return get_mixtral_tokenizer(size)
+    elif model == "ministral":
+        return get_ministral_tokenizer(size)
     else:
         raise ValueError(f"Model {model} not supported.")
 
@@ -33,3 +35,10 @@ def get_mistral_tokenizer(size: str):
 def get_mixtral_tokenizer(size: str):
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(get_model_path("mixtral", size), use_fast=False)
+
+def get_ministral_tokenizer(size: str):
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(
+        get_model_path("ministral", size),
+        fix_mistral_regex=True,
+    )
