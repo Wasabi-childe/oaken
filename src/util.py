@@ -55,6 +55,22 @@ def get_model_device_map(model_name: str, num_device: int, num_layer: int,
                 num_layer,
                 device_start_num,
             )
+        case "gpt2":
+            device_map = {
+                'transformer.wte': device_start_num,
+                'transformer.wpe': device_start_num,
+                'transformer.ln_f': LAST_GPU_IDX,
+                'lm_head': LAST_GPU_IDX,
+            }
+
+            set_decoder_device_map(
+                device_map,
+                'transformer.h',
+                num_device,
+                num_layer,
+                device_start_num,
+            )
+        
         case "mistral":
             device_map = {
                 'model.embed_tokens': device_start_num,
