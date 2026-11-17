@@ -21,11 +21,13 @@ def get_model_path(model: str, size: str):
 def get_model(device, tokenizer, model: str, size: str, gpu_count=1, gpu_start_idx=0):
     config = AutoConfig.from_pretrained(get_model_path(model, size))
 
+    if config.model_type == "mistral3":
+        num_hidden_layers = config.text_config.num_hidden_layers
+    else:
+        num_hidden_layers = config.num_hidden_layers
+
     device_map = get_model_device_map(
-        model,
-        gpu_count,
-        config.num_hidden_layers,
-        gpu_start_idx,
+        model, gpu_count, num_hidden_layers, gpu_start_idx
     )
 
     match model:
