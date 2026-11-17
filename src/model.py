@@ -9,6 +9,8 @@ def get_model_path(model: str, size: str):
     match model:
         case "llama" | "llama2":
             return f"{MODEL_STORAGE_PREFIX}/llama2-{size}/{MODEL_STORATE_POSTFIX}"
+        case "gpt2":
+            return f"{MODEL_STORAGE_PREFIX}/gpt2-{size}/"
         case "opt":
             return f"{MODEL_STORAGE_PREFIX}/opt-{size}/{MODEL_STORATE_POSTFIX}"
         case "mistral":
