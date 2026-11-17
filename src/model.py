@@ -15,6 +15,8 @@ def get_model_path(model: str, size: str):
             return f"{MODEL_STORAGE_PREFIX}/mistral-{size}/{MODEL_STORATE_POSTFIX}"
         case "mixtral":
             return f"{MODEL_STORAGE_PREFIX}/mixtral-{size}/{MODEL_STORATE_POSTFIX}"
+        case "ministral":
+            return f"{MODEL_STORAGE_PREFIX}/ministral-{size}/{MODEL_STORATE_POSTFIX}"
         case _:
             raise ValueError(f"Model {model} not supported.")
 
@@ -86,5 +88,15 @@ def get_model(device, tokenizer, model: str, size: str, gpu_count=1, gpu_start_i
                                                 pad_token_id=tokenizer.eos_token_id,
                                                 device_map=device_map,
                                             )
+        case "ministral":
+            from transformers.models.mistral3.modeling_mistral3 import (
+                Mistral3ForConditionalGeneration
+            )
+
+            return Mistral3ForConditionalGeneration.from_pretrained(
+                get_model_path(model, size),
+                torch_dtype=torch.float16,
+                device_map=device_map,
+            )
         case _:
             raise ValueError(f"Model {model} not supported.")
