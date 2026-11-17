@@ -249,7 +249,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             storage = cls.calculate_storage(
                 head_dim=head_dim,
                 num_kv_heads=num_heads,
-                outlier_counts=token_counts.tolist()
+                k_outlier_counts=token_counts.tolist()
             )
             storage_results.append(storage)
 
