@@ -248,7 +248,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         for token_counts in flat_counts:
             storage = cls.calculate_storage(
                 head_dim=head_dim,
-                num_heads=num_heads,
+                num_kv_heads=num_heads,
                 outlier_counts=token_counts.tolist()
             )
             storage_results.append(storage)
