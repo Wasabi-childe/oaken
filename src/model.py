@@ -47,12 +47,27 @@ def get_model(device, tokenizer, model: str, size: str, gpu_count=1, gpu_start_i
                                             )
         case "opt":
             from transformers.models.opt.modeling_opt import OPTForCausalLM
-            return OPTForCausalLM.from_pretrained(get_model_path(model, size),
-                                                torch_dtype=torch.float16,
-                                                use_cache=True,
-                                                pad_token_id=tokenizer.eos_token_id,
-                                                device_map=device_map,
-                                            )
+
+            model_instance = OPTForCausalLM.from_pretrained(
+                get_model_path(model, size),
+                torch_dtype=torch.float16,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
+                device_map=device_map,
+            )
+
+            # Fix OPT projection layers being placed on CPU
+            decoder = model_instance.model.decoder
+            device = decoder.embed_tokens.weight.device
+
+            if decoder.project_in is not None:
+                decoder.project_in.to(device)
+
+            if decoder.project_out is not None:
+                decoder.project_out.to(device)
+
+            return model_instance
+        
         case "mistral":
             from transformers.models.mistral.modeling_mistral import MistralForCausalLM
             return MistralForCausalLM.from_pretrained(get_model_path(model, size),
