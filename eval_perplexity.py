@@ -82,8 +82,8 @@ def eval_perplexity(args, model, tokenizer, device):
     )
 
     # Sequence length
-    max_length = 4096
-    stride = 4096
+    max_length = 2048
+    stride = 2048
 
     seq_len = encodings.input_ids.size(1)
 
