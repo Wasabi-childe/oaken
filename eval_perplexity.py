@@ -71,7 +71,7 @@ def eval_perplexity(args, model, tokenizer, device):
 
     # Load WikiText-2 test dataset
     test = load_dataset(
-        "wikitext",
+        "Salesforce/wikitext",
         "wikitext-2-raw-v1",
         split="test"
     )
