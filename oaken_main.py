@@ -22,6 +22,13 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
         "counter": [0.0 for _ in range(n_layer)]
     }
 
+    storage_totals = {
+        "total_bits": 0,
+        "baseline_bits": 0,
+        "total_bytes": 0,
+        "count": 0
+    }
+
     # ------------------------------------------------
     # V PROJECTION: Direct FP4, without mean compensation
     # ------------------------------------------------
@@ -52,11 +59,10 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
 
     def key_quantize_activation_hook(i, module, input, output):
 
-        # Use the first (outermost) threshold pair
         key_lower = quantizer_stat["key"]["lower_threshold"][i][:1]
         key_upper = quantizer_stat["key"]["upper_threshold"][i][:1]
 
-        tensor, sparsity, heatmap = (
+        tensor, sparsity, storage_results = (
             MultiThresholdTokenwiseQuantizer.downsample(
                 output,
                 key_lower,
@@ -64,6 +70,14 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
                 use_mean_compensation=True
             )
         )
+
+        # Accumulate K+V storage estimates
+        if storage_results is not None:
+            for item in storage_results:
+                storage_totals["total_bits"] += item["total_bits"]
+                storage_totals["baseline_bits"] += item["baseline_bits"]
+                storage_totals["total_bytes"] += item["total_bytes"]
+                storage_totals["count"] += 1
 
         sparsity_information["key"][i] = [
             a + b for a, b in zip(
@@ -95,6 +109,32 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     # ------------------------------------------------
 
     runner(args, model, tokenizer, device)
+
+        # ------------------------------------------------
+    # Calculate memory reduction
+    # ------------------------------------------------
+
+    if storage_totals["baseline_bits"] > 0:
+
+        memory_reduction = (
+            1 - storage_totals["total_bits"]
+            / storage_totals["baseline_bits"]
+        ) * 100
+
+        average_bytes = (
+            storage_totals["total_bytes"]
+            / storage_totals["count"]
+        )
+
+        print("\n========== MEMORY RESULTS ==========")
+        print("FP16 baseline: {:.2f} bits/token".format(
+            storage_totals["baseline_bits"] / storage_totals["count"]
+        ))
+        print("Compressed storage: {:.2f} bytes/token".format(
+            average_bytes
+        ))
+        print("Memory reduction: {:.2f}%".format(memory_reduction))
+        print("====================================\n")
 
     # ------------------------------------------------
     # Calculate average sparsity
