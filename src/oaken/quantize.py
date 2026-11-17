@@ -50,6 +50,53 @@ class OakenQuantizer:
 
         return levels[indices]
 
+    @staticmethod
+    def calculate_storage(
+        num_kv_heads,
+        head_dim,
+        k_outlier_counts
+    ):
+        # FP4 K and V payload
+        payload_bits = num_kv_heads * head_dim * 2 * 4
+
+        # FP8 K and V scales
+        scale_bits = num_kv_heads * 2 * 8
+
+        # One FP4 mean per K head
+        mean_bits = num_kv_heads * 4
+
+        # Outlier index (7 bits) + sign (1 bit)
+        outlier_bits = sum(k_outlier_counts) * 8
+
+        # One 8-bit count per K head
+        count_bits = num_kv_heads * 8
+
+        total_bits = (
+            payload_bits
+            + scale_bits
+            + mean_bits
+            + outlier_bits
+            + count_bits
+        )
+
+        # Round up to complete bytes
+        total_bytes = (total_bits + 7) // 8
+
+        baseline_bits = num_kv_heads * head_dim * 2 * 16
+        reduction = (1 - total_bits / baseline_bits) * 100
+
+        return {
+            "payload_bits": payload_bits,
+            "scale_bits": scale_bits,
+            "mean_bits": mean_bits,
+            "outlier_bits": outlier_bits,
+            "count_bits": count_bits,
+            "total_bits": total_bits,
+            "total_bytes": total_bytes,
+            "baseline_bits": baseline_bits,
+            "reduction_percent": reduction
+        }
+    
     @classmethod
     def fp4_quantize(cls, tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -157,6 +204,10 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         _, _, outlier_mask = cls.get_outlier_threshold(
             x, threshold_lower, threshold_upper
         )
+        # Keep actual count for every head and token
+        actual_outlier_counts = (
+            outlier_mask.sum(dim=-1).to(torch.int64)
+        )
 
         # 2. One absolute outlier mean per head per token
         outlier_count = outlier_mask.sum(dim=-1, keepdim=True).clamp(min=1)
@@ -185,4 +236,21 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         val_frac = [outlier_mask.float().mean().item()]
 
-        return reconstructed, val_frac, None
+        # Count heads in the grouped tensor
+        num_heads = x.shape[-2]
+
+        # Each leading-dimension position represents a token/head group.
+        # Calculate storage separately for each token.
+        storage_results = []
+
+        flat_counts = actual_outlier_counts.reshape(-1, num_heads)
+
+        for token_counts in flat_counts:
+            storage = cls.calculate_storage(
+                head_dim=head_dim,
+                num_heads=num_heads,
+                outlier_counts=token_counts.tolist()
+            )
+            storage_results.append(storage)
+
+        return reconstructed, val_frac, storage_results
