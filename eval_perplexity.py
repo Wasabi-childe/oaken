@@ -119,7 +119,7 @@ def eval_perplexity(args, model, tokenizer, device):
             break
 
     # Calculate perplexity
-    ppl = torch.exp(torch.stack(nlls).mean())
+    ppl = torch.exp(torch.stack(nlls).float().mean())
 
     # Print results
     print("\n===== RESULTS =====")
