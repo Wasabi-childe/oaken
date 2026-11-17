@@ -10,7 +10,10 @@ def multi_group_oaken_main(args, model, tokenizer, device, runner):
     with open(args.quantizer_path, "r") as f:
         quantizer_stat = json.load(f)
 
-    n_layer = len(model.get_decoder().layers)
+    if args.model == "gpt2":
+        n_layer = len(model.transformer.h)
+    else:
+        n_layer = len(model.get_decoder().layers)
 
     # Only one outlier group is used
     sparsity_information = {
