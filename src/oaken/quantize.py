@@ -8,7 +8,7 @@ class OakenQuantizer:
     FLOAT_TOLERANCE = 1e-6
 
     # Set once (e.g. OakenQuantizer.HEAD_DIM = 64) if you cannot change the call site.
-    HEAD_DIM = 64
+    HEAD_DIM = 128
 
     # FP4 E2M1 positive magnitude levels
     FP4_LEVELS = [
