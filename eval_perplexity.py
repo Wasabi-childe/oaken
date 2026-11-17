@@ -69,8 +69,8 @@ def eval_perplexity(args, model, tokenizer, device):
     test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
 
-    max_length = 2048
-    stride = 2048
+    max_length = 4096
+    stride = 4096
     seq_len = encodings.input_ids.size(1)
 
     nlls = []
