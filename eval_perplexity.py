@@ -56,29 +56,54 @@ def main(args):
             print("Running Original Model")
             eval_perplexity(args, model, tokenizer, torch_device)
 
+
 def eval_perplexity(args, model, tokenizer, device):
     if hasattr(args, "single_run") and args.single_run:
         input_prompt = input("Enter the input prompt: ")
         assert(input_prompt != "")
-        input_tensor = tokenizer.encode(input_prompt, return_tensors="pt").to(device)
+        input_tensor = tokenizer.encode(
+            input_prompt, return_tensors="pt"
+        ).to(device)
+
         output = model.generate(input_tensor, max_length=100)
         print(f"Model output: {tokenizer.decode(output[0], skip_special_tokens=True)}")
         return
 
-    # Code from huggingface: https://huggingface.co/docs/transformers/ko/perplexity
-    test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+    # Load WikiText-2 test dataset
+    test = load_dataset(
+        "wikitext",
+        "wikitext-2-raw-v1",
+        split="test"
+    )
 
+    encodings = tokenizer(
+        "\n\n".join(test["text"]),
+        return_tensors="pt"
+    )
+
+    # Sequence length
     max_length = 4096
     stride = 4096
+
     seq_len = encodings.input_ids.size(1)
 
     nlls = []
     prev_end_loc = 0
+
+    # Reset peak GPU memory statistics
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+    # Perplexity evaluation
     for begin_loc in tqdm(range(0, seq_len, stride)):
+
         end_loc = min(begin_loc + max_length, seq_len)
         trg_len = end_loc - prev_end_loc
-        input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
+
+        input_ids = encodings.input_ids[
+            :, begin_loc:end_loc
+        ].to(device)
+
         target_ids = input_ids.clone()
         target_ids[:, :-trg_len] = -100
 
@@ -89,12 +114,27 @@ def eval_perplexity(args, model, tokenizer, device):
         nlls.append(neg_log_likelihood)
 
         prev_end_loc = end_loc
+
         if end_loc == seq_len:
             break
 
+    # Calculate perplexity
     ppl = torch.exp(torch.stack(nlls).mean())
-    print(ppl)
+
+    # Print results
+    print("\n===== RESULTS =====")
+    print(f"Perplexity: {ppl.item():.4f}")
+
+    if torch.cuda.is_available():
+        peak_mem_gb = (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        )
+        print(f"Peak GPU memory: {peak_mem_gb:.4f} GB")
+
+    print("====================")
+
     return
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the evaluation of a model on a set of tasks.")
