@@ -35,20 +35,15 @@ class OakenQuantizer:
         return inlier, outlier, outlier_mask
 
     @classmethod
-    def fp4_mean_quantize(cls, mean: torch.Tensor) -> torch.Tensor:
-        """Nearest FP4 E2M1 value for a positive mean (no extra scale)."""
+    def int4_mean_quantize(cls, mean: torch.Tensor) -> torch.Tensor:
+        """Quantize absolute mean to unsigned magnitude range of INT4."""
 
         mean = mean.float()
 
-        levels = torch.tensor(
-            cls.FP4_LEVELS, dtype=mean.dtype, device=mean.device
-        )
+        quantized = torch.round(mean)
+        quantized = torch.clamp(quantized, 0, 7)
 
-        boundaries = (levels[:-1] + levels[1:]) / 2.0
-
-        indices = torch.bucketize(mean.contiguous(), boundaries)
-
-        return levels[indices]
+        return quantized
 
     @staticmethod
     def calculate_storage(
@@ -217,7 +212,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         )
 
         # 3. Round the mean to FP4 E2M1
-        mean_abs = cls.fp4_mean_quantize(mean_abs)
+        mean_abs = cls.int4_mean_quantize(mean_abs)
 
         # 4. Subtract the signed mean at outlier positions
         offset = torch.where(
