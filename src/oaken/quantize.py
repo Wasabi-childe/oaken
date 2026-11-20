@@ -254,7 +254,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         flat_counts = actual_outlier_counts.reshape(-1, num_chunks)
 
-        for token_idx, token_counts in enumerate(flat_counts):
+        for token_idx, token_counts in enumerate(flat_counts[:5]):
             print(
                 "Token {}: {}".format(
                     token_idx,
