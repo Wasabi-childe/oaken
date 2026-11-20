@@ -250,6 +250,18 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
             outlier_mask.sum(dim=-1).to(torch.int64)
         )
 
+        print("\nOutlier counts per token:")
+
+        flat_counts = actual_outlier_counts.reshape(-1, num_chunks)
+
+        for token_idx, token_counts in enumerate(flat_counts):
+            print(
+                "Token {}: {}".format(
+                    token_idx,
+                    token_counts.tolist()
+                )
+            )
+
         # 2. Calculate absolute outlier mean per chunk
 
         outlier_count = (
