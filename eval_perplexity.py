@@ -22,6 +22,18 @@ def main(args):
     torch_device = "cuda"
     tokenizer = get_tokenizer(args.model, args.model_size)
 
+
+    torch_device = "cuda"
+    tokenizer = get_tokenizer(args.model, args.model_size)
+
+    print("\n===== TOKENIZER INFORMATION =====")
+    print("Tokenizer path:", tokenizer.name_or_path)
+    print("Tokenizer class:", tokenizer.__class__.__name__)
+    print("Vocabulary size:", len(tokenizer))
+    print("EOS token:", tokenizer.eos_token)
+    print("BOS token:", tokenizer.bos_token)
+    print("=================================\n")
+
     if args.quant_method == "kivi":
         from kivi_main import get_kivi_eval_model
         model = get_kivi_eval_model(torch_device, tokenizer, args.model, args.model_size, args.gpu_count, args.gpu_start_idx)
