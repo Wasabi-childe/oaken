@@ -1,3 +1,4 @@
+
 import torch
 from typing import Tuple
 
@@ -7,7 +8,11 @@ class OakenQuantizer:
     QUANTIZE_BITS = 4
     FLOAT_TOLERANCE = 1e-6
 
-    # Set once (e.g. OakenQuantizer.HEAD_DIM = 64) if you cannot change the call site.
+    # Fixed hardware processing unit
+    CHUNK_SIZE = 64
+
+    # Actual attention head dimension.
+    # Set this according to the model configuration.
     HEAD_DIM = 64
 
     # FP4 E2M1 positive magnitude levels
@@ -36,7 +41,6 @@ class OakenQuantizer:
 
     @classmethod
     def int4_mean_quantize(cls, mean: torch.Tensor) -> torch.Tensor:
-        """Quantize absolute mean to unsigned magnitude range of INT4."""
 
         mean = mean.float()
 
@@ -47,24 +51,25 @@ class OakenQuantizer:
 
     @staticmethod
     def calculate_storage(
-        num_kv_heads,
-        head_dim,
+        num_chunks,
+        chunk_size,
         k_outlier_counts
     ):
+
         # FP4 K and V payload
-        payload_bits = num_kv_heads * head_dim * 2 * 4
+        payload_bits = num_chunks * chunk_size * 2 * 4
 
-        # FP8 K and V scales
-        scale_bits = num_kv_heads * 2 * 8
+        # FP8 K and V scales: one per chunk
+        scale_bits = num_chunks * 2 * 8
 
-        # One FP4 mean per K head
-        mean_bits = num_kv_heads * 4
+        # One 4-bit mean per K chunk
+        mean_bits = num_chunks * 4
 
         # Outlier index (7 bits) + sign (1 bit)
         outlier_bits = sum(k_outlier_counts) * 8
 
-        # One 8-bit count per K head
-        count_bits = num_kv_heads * 8
+        # One 8-bit count per K chunk
+        count_bits = num_chunks * 8
 
         total_bits = (
             payload_bits
@@ -74,11 +79,13 @@ class OakenQuantizer:
             + count_bits
         )
 
-        # Round up to complete bytes
         total_bytes = (total_bits + 7) // 8
 
-        baseline_bits = num_kv_heads * head_dim * 2 * 16
-        reduction = (1 - total_bits / baseline_bits) * 100
+        baseline_bits = num_chunks * chunk_size * 2 * 16
+
+        reduction = (
+            1 - total_bits / baseline_bits
+        ) * 100
 
         return {
             "payload_bits": payload_bits,
@@ -91,21 +98,18 @@ class OakenQuantizer:
             "baseline_bits": baseline_bits,
             "reduction_percent": reduction
         }
-    
+
     @classmethod
     def fp4_quantize(cls, tensor: torch.Tensor) -> torch.Tensor:
-        """
-        FP4 E2M1 fake quantization.
-
-        One FP8 E4M3 scale per group, where a group is the LAST dimension.
-        Callers reshape so that the last dimension is one head.
-        """
 
         tensor = tensor.float()
 
+        # One scale per 64-element chunk
         max_abs = tensor.abs().amax(dim=-1, keepdim=True)
 
-        scale = (max_abs / 6.0).to(torch.float8_e4m3fn).float()
+        scale = (
+            max_abs / 6.0
+        ).to(torch.float8_e4m3fn).float()
 
         scale = torch.where(
             scale == 0,
@@ -116,12 +120,17 @@ class OakenQuantizer:
         normalized = tensor / scale
 
         levels = torch.tensor(
-            cls.FP4_LEVELS, dtype=normalized.dtype, device=normalized.device
+            cls.FP4_LEVELS,
+            dtype=normalized.dtype,
+            device=normalized.device
         )
 
         boundaries = (levels[:-1] + levels[1:]) / 2.0
 
-        indices = torch.bucketize(normalized.abs().contiguous(), boundaries)
+        indices = torch.bucketize(
+            normalized.abs().contiguous(),
+            boundaries
+        )
 
         quantized = normalized.sign() * levels[indices]
 
@@ -141,111 +150,170 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         use_mean_compensation: bool = False,
         head_dim: int = None
     ):
+
         """
-        K (use_mean_compensation=True):
-            Threshold outliers, one absolute outlier mean per head per token
-            (rounded to FP4), signed mean compensation, FP4 quantization.
+        K:
+            Divide each head into 64-element chunks.
+            Detect outliers independently per chunk.
+            Calculate one outlier mean per chunk.
+            Apply FP4 quantization with one FP8 scale per chunk.
 
-        V (use_mean_compensation=False):
-            Direct FP4 quantization.
+        V:
+            Direct FP4 quantization with one FP8 scale per chunk.
 
-        Scale (FP8 E4M3), outlier mean and outlier count are all per head
-        per token.
+        Metadata:
+            K: 4-bit mean + 8-bit count per chunk.
+            K and V: FP8 scale per chunk.
         """
 
-        head_dim = head_dim if head_dim is not None else cls.HEAD_DIM
+        chunk_size = cls.CHUNK_SIZE
+
+        head_dim = (
+            head_dim if head_dim is not None
+            else cls.HEAD_DIM
+        )
 
         orig_shape = input_tensor.shape
         x = input_tensor.float()
 
         # ------------------------------------------------
-        # Group the last dimension into heads
+        # Divide into attention heads and 64-element chunks
         # ------------------------------------------------
 
-        if head_dim is not None and orig_shape[-1] != head_dim:
-            if orig_shape[-1] % head_dim != 0:
-                raise ValueError(
-                    f"Last dim {orig_shape[-1]} is not divisible by head_dim {head_dim}."
-                )
-            x = x.reshape(*orig_shape[:-1], orig_shape[-1] // head_dim, head_dim)
+        if orig_shape[-1] % head_dim != 0:
+            raise ValueError(
+                "Hidden dimension must be divisible by head_dim."
+            )
+
+        if head_dim % chunk_size != 0:
+            raise ValueError(
+                "head_dim must be divisible by chunk_size."
+            )
+
+        num_heads = orig_shape[-1] // head_dim
+
+        chunks_per_head = head_dim // chunk_size
+
+        num_chunks = num_heads * chunks_per_head
+
+        x = x.reshape(
+            *orig_shape[:-1],
+            num_heads,
+            chunks_per_head,
+            chunk_size
+        )
 
         # ------------------------------------------------
-        # V PATH: direct FP4
+        # V PATH: Direct FP4 quantization
         # ------------------------------------------------
 
         if not use_mean_compensation:
 
             reconstructed = cls.fp4_quantize(x)
-            reconstructed = reconstructed.reshape(orig_shape).to(torch.float16)
+
+            reconstructed = (
+                reconstructed
+                .reshape(orig_shape)
+                .to(torch.float16)
+            )
 
             return reconstructed, [0.0], None
 
         # ------------------------------------------------
-        # K PATH: mean-based outlier compensation
+        # K PATH: Mean-based outlier compensation
         # ------------------------------------------------
 
         if threshold_lowers is None or threshold_uppers is None:
-            raise ValueError("K quantization requires lower and upper thresholds.")
+            raise ValueError(
+                "K quantization requires lower and upper thresholds."
+            )
 
         if len(threshold_lowers) != 1 or len(threshold_uppers) != 1:
             raise ValueError(
-                "This algorithm requires exactly one lower and one upper threshold."
+                "Exactly one lower and upper threshold are required."
             )
 
         threshold_lower = threshold_lowers[0]
         threshold_upper = threshold_uppers[0]
 
-        # 1. Detect outliers
+        # 1. Detect outliers independently in each chunk
+
         _, _, outlier_mask = cls.get_outlier_threshold(
-            x, threshold_lower, threshold_upper
+            x,
+            threshold_lower,
+            threshold_upper
         )
-        # Keep actual count for every head and token
+
+        # Actual outlier count per chunk
+
         actual_outlier_counts = (
             outlier_mask.sum(dim=-1).to(torch.int64)
         )
 
-        # 2. One absolute outlier mean per head per token
-        outlier_count = outlier_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        # 2. Calculate absolute outlier mean per chunk
 
-        mean_abs = (
-            (x.abs() * outlier_mask).sum(dim=-1, keepdim=True) / outlier_count
+        outlier_count = (
+            outlier_mask.sum(dim=-1, keepdim=True).clamp(min=1)
         )
 
-        # 3. Round the mean to FP4 E2M1
+        mean_abs = (
+            (x.abs() * outlier_mask).sum(
+                dim=-1,
+                keepdim=True
+            ) / outlier_count
+        )
+
+        # 3. Quantize mean to unsigned 4-bit integer
+
         mean_abs = cls.int4_mean_quantize(mean_abs)
 
-        # 4. Subtract the signed mean at outlier positions
+        # 4. Subtract signed mean at outlier positions
+
         offset = torch.where(
             outlier_mask,
             x.sign() * mean_abs,
             torch.zeros_like(x)
         )
 
-        # 5. Quantize the whole modified head vector (scale per head)
+        # 5. FP4 quantization independently per 64-element chunk
+
         reconstructed = cls.fp4_quantize(x - offset)
 
-        # 6. Add the mean back
+        # 6. Add mean back
+
         reconstructed = reconstructed + offset
 
-        reconstructed = reconstructed.reshape(orig_shape).to(torch.float16)
+        reconstructed = (
+            reconstructed
+            .reshape(orig_shape)
+            .to(torch.float16)
+        )
 
-        val_frac = [outlier_mask.float().mean().item()]
+        # Outlier fraction
 
-        # Count heads in the grouped tensor
-        num_heads = x.shape[-2]
+        val_frac = [
+            outlier_mask.float().mean().item()
+        ]
 
-        # Each leading-dimension position represents a token/head group.
-        # Calculate storage separately for each token.
+        # ------------------------------------------------
+        # Calculate storage per token
+        # ------------------------------------------------
+
         storage_results = []
 
-        flat_counts = actual_outlier_counts.reshape(-1, num_heads)
+        flat_counts = actual_outlier_counts.reshape(
+            -1,
+            num_chunks
+        )
 
         for token_counts in flat_counts:
+
             storage = cls.calculate_storage(
-                head_dim=head_dim,
-                num_kv_heads=num_heads,
+                num_chunks=num_chunks,
+                chunk_size=chunk_size,
                 k_outlier_counts=token_counts.tolist()
             )
+
             storage_results.append(storage)
 
         return reconstructed, val_frac, storage_results
