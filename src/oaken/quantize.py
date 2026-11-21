@@ -11,10 +11,6 @@ class OakenQuantizer:
     # Fixed hardware processing unit
     CHUNK_SIZE = 64
 
-    # Actual attention head dimension.
-    # Set this according to the model configuration.
-    HEAD_DIM = 64
-
     # FP4 E2M1 positive magnitude levels
     FP4_LEVELS = [
         0.0, 0.5, 1.0, 1.5,
@@ -147,8 +143,7 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         threshold_uppers=None,
         quantize_outlier: bool = True,
         use_group_shift: bool = False,
-        use_mean_compensation: bool = False,
-        head_dim: int = None
+        use_mean_compensation: bool = False
     ):
 
         """
@@ -168,11 +163,6 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
 
         chunk_size = cls.CHUNK_SIZE
 
-        head_dim = (
-            head_dim if head_dim is not None
-            else cls.HEAD_DIM
-        )
-
         orig_shape = input_tensor.shape
         x = input_tensor.float()
 
@@ -180,28 +170,21 @@ class MultiThresholdTokenwiseQuantizer(OakenQuantizer):
         # Divide into attention heads and 64-element chunks
         # ------------------------------------------------
 
-        if orig_shape[-1] % head_dim != 0:
+        orig_shape = input_tensor.shape
+        x = input_tensor.float()
+
+        if orig_shape[-1] % chunk_size != 0:
             raise ValueError(
-                "Hidden dimension must be divisible by head_dim."
+                "Hidden dimension must be divisible by chunk_size."
             )
 
-        if head_dim % chunk_size != 0:
-            raise ValueError(
-                "head_dim must be divisible by chunk_size."
-            )
-
-        num_heads = orig_shape[-1] // head_dim
-
-        chunks_per_head = head_dim // chunk_size
-
-        num_chunks = num_heads * chunks_per_head
+        num_chunks = orig_shape[-1] // chunk_size
 
         x = x.reshape(
             *orig_shape[:-1],
-            num_heads,
-            chunks_per_head,
+            num_chunks,
             chunk_size
-        )
+)
 
         # ------------------------------------------------
         # V PATH: Direct FP4 quantization
