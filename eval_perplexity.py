@@ -71,7 +71,7 @@ def main(args):
 
 def eval_perplexity(args, model, tokenizer, device):
     if hasattr(args, "single_run") and args.single_run:
-        input_prompt = input("Enter the input prompt: ")
+        input_prompt = "The capital city of Australia is"
         assert(input_prompt != "")
         input_tensor = tokenizer.encode(
             input_prompt, return_tensors="pt"
