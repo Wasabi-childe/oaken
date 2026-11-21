@@ -9,7 +9,7 @@ class OakenQuantizer:
     FLOAT_TOLERANCE = 1e-6
 
     # Fixed hardware processing unit
-    CHUNK_SIZE = 64
+    CHUNK_SIZE = 128
 
     # FP4 E2M1 positive magnitude levels
     FP4_LEVELS = [
